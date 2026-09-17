@@ -1,0 +1,1 @@
+{"version": "v1", "key": {"seed": 23092008, "budget": 4930}, "data": {"rows": [{"name": "Memo 01/02 approach", "value": 61, "units": 18, "trips": 7, "cost": 4108.0, "ms": 0.2620220184326172}, {"name": "Improved (Memo 03)", "value": 91, "units": 26, "trips": 11, "cost": 4837.0, "ms": 12578.598976135254}]}}

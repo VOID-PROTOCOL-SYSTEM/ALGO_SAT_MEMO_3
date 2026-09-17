@@ -1,0 +1,1 @@
+{"version": "v2", "key": {"seed": 23092008, "ants_values": [8, 16, 32, 48, 64]}, "data": {"rows": [{"ants": 8, "value": 91, "runtime_ms": 10570.7}, {"ants": 16, "value": 91, "runtime_ms": 11484.8}, {"ants": 32, "value": 91, "runtime_ms": 12987.6}, {"ants": 48, "value": 91, "runtime_ms": 17905.6}, {"ants": 64, "value": 91, "runtime_ms": 23619.2}]}}
