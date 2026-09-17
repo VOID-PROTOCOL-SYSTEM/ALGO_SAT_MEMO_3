@@ -1,3 +1,8 @@
+# /// script
+# [tool.marimo.display]
+# theme = "dark"
+# ///
+
 import marimo
 
 __generated_with = "0.23.4"
