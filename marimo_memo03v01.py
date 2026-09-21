@@ -20,6 +20,7 @@ def imports():
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import matplotlib.colors as mcolors
+    import matplotlib.animation as animation
     from matplotlib.colors import LinearSegmentedColormap
     import json
     import os
@@ -1039,6 +1040,26 @@ def _(json, os):
 
 
 @app.cell
+def _(json, os):
+    def load_or_render_gif(gif_path, version, key, render_fn):
+        meta_path = gif_path + ".json"
+        if os.path.exists(gif_path) and os.path.exists(meta_path):
+            with open(meta_path) as f:
+                meta = json.load(f)
+            if meta.get("version") == version and meta.get("key") == key:
+                return gif_path
+
+        os.makedirs(os.path.dirname(gif_path) or ".", exist_ok=True)
+        render_fn(gif_path)
+
+        with open(meta_path, "w") as f:
+            json.dump({"version": version, "key": key}, f)
+        return gif_path
+
+    return
+
+
+@app.cell
 def m31_code_header(mo):
     mo.md("""
     ### [M3-1 RUN] Implement your algorithm
@@ -1081,15 +1102,16 @@ def m31_student_algorithm(
 ):
     """
     Design:
-        trained actor-critic policy with pheromone guided ant colony optimiser + elite pheromone learning + final supply swap search iterations and 
-        forced supply insertion checks to polish off plan.
+        trained actor-critic policy with pheromone guided ant colony optimiser that runs an or-opt for every ant in every ACO restart + elite pheromone learning + 
+        final supply swap search iterations and forced supply insertion checks
     """
 
     import torch
     import train_hybrid_aco_policies as trainmod
 
     """ 
-    train_hybrid_aco_policies is the python file that contains the actor-critic model using torch - trained over 15000 instances
+    train_hybrid_aco_policies is the python file that contains the actor-critic model using torch - utilises 3 separate checkpoint files (1 for every fac size - 2/3/4)
+    and each trained on 15000 unique instances
     """
     # Same helper calculator functions from earlier in marimo file, but copied directly here
     def _trip_cost(trip):
@@ -1280,6 +1302,86 @@ def m31_student_algorithm(
         for key in pheromone:
             pheromone[key] = min(max(pheromone[key], min_pheromone), max_pheromone)
 
+    def or_opt_plan(plan, inst, max_segment=3, first_improvement=True):
+        CAP = inst["CAP"]
+        BUDGET = inst["BUDGET"]
+        MASS = inst["MASS"]
+        trip_cost = inst["trip_cost"]
+        EXIT_LEG = inst.get("EXIT_LEG", 0.0)
+        current = copy_plan(plan)
+
+        improved = True
+        while improved:
+            improved = False
+            current_cost = aco_plan_cost(current, inst)
+
+            for src_i, src_trip in enumerate(current):
+                n = len(src_trip)
+                src_trip_cost = trip_cost(src_trip)
+
+                for seg_len in range(1, min(max_segment, n) + 1):
+                    for start in range(n - seg_len + 1):
+                        segment = src_trip[start:start + seg_len]
+                        remainder = src_trip[:start] + src_trip[start + seg_len:]
+                        seg_mass = sum(MASS[u] for u in segment)
+                        remainder_cost = trip_cost(remainder) if remainder else 0.0
+
+                        for dst_i, dst_trip in enumerate(current):
+                            if dst_i == src_i:
+                                dst_base = remainder
+                                dst_base_cost = remainder_cost
+                            else:
+                                dst_base = dst_trip
+                                dst_load = sum(MASS[u] for u in dst_base)
+                                if dst_load + seg_mass > CAP + 1e-9:
+                                    continue
+                                dst_base_cost = trip_cost(dst_base)
+
+                            for seg_variant in (segment, list(reversed(segment))):
+                                for pos in range(len(dst_base) + 1):
+                                    if dst_i == src_i and pos == start:
+                                        continue  # no-op, same position
+
+                                    new_dst = dst_base[:pos] + seg_variant + dst_base[pos:]
+                                    new_dst_cost = trip_cost(new_dst)
+
+                                    # Delta cost: only the affected trip(s) changed --
+                                    # everything else in the plan is untouched, so
+                                    # there's no need to re-sum the whole plan.
+                                    if dst_i == src_i:
+                                        cand_cost = current_cost - src_trip_cost + new_dst_cost
+                                    else:
+                                        cand_cost = (current_cost - src_trip_cost - dst_base_cost
+                                                     + remainder_cost + new_dst_cost)
+
+                                    if cand_cost > BUDGET + 1e-9:
+                                        continue
+                                    if cand_cost < current_cost - 1e-9:
+                                        candidate = copy_plan(current)
+                                        if dst_i == src_i:
+                                            candidate[src_i] = new_dst
+                                        else:
+                                            candidate[src_i] = remainder
+                                            candidate[dst_i] = new_dst
+                                        candidate = [t for t in candidate if t]
+
+                                        current = candidate
+                                        current_cost = cand_cost
+                                        improved = True
+                                        if first_improvement:
+                                            break
+                                if improved and first_improvement:
+                                    break
+                            if improved and first_improvement:
+                                break
+                        if improved and first_improvement:
+                            break
+                    if improved and first_improvement:
+                        break
+                if improved and first_improvement:
+                    break
+        return current
+
     # Iteration Based ACO
     def run_iterative_aco(inst, actor, critic, initial_best, n_ants=32, n_iterations=20, evaporation=0.15, elitist_weight=1.5, dist_scale=None, mode="sample", seed=0):
         if dist_scale is None:
@@ -1301,6 +1403,11 @@ def m31_student_algorithm(
 
                 valid, _ = inst_validate(inst, raw_plan)
                 plan_for_ant = raw_plan if valid else []
+
+                if plan_for_ant:
+                    plan_for_ant = or_opt_plan(plan_for_ant, inst, max_segment=3)   # <-- new: cheap routing polish
+                    plan_for_ant = top_up_plan(plan_for_ant, inst, max_insert_size=2)  # now has freed budget to spend
+                    
                 value = aco_plan_value(plan_for_ant, inst)
                 raw_values.append(value)
                 iter_plans.append((copy_plan(plan_for_ant), value))
@@ -1537,7 +1644,7 @@ def m31_student_algorithm(
         return best, best_source
 
     # ACO CONFIG SETTINGS EDIT
-    aco_checkpoint_dir = "."
+    aco_checkpoint_dir = "MEMO_3/"
     aco_ants = 32
     aco_iterations = 20
     aco_evaporation = 0.15
@@ -1574,8 +1681,56 @@ def m31_student_algorithm(
             if _ok else
             "**Plan is invalid:**\n\n" + "\n".join(f"- {p}" for p in _problems))
 
-    mo.callout(mo.md(_msg), kind="success" if _ok else "danger")
+    mo.show_code(mo.callout(mo.md(_msg), kind="success" if _ok else "danger"))
     return aco_rng_seed, my_algorithm, my_plan
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### At a Glance
+
+    Budget spent, priority value captured, and supplies collected, each as
+    a gauge against its own ceiling.
+    """)
+    return
+
+
+@app.cell
+def _(BUDGET, SUPPLIES, VALUE, my_plan, plan_cost, plan_value, plt):
+    _cost = plan_cost(my_plan)
+    _value = plan_value(my_plan)
+    _max_value = sum(VALUE.values())
+    _collected = {u for trip in my_plan for u in trip}
+    _n_collected = len(_collected)
+    _n_total = len(SUPPLIES)
+
+    def _gauge(ax, frac, label, sub, color):
+        frac = max(0.0, min(1.0, frac))
+        ax.pie([frac, 1 - frac], startangle=90, counterclock=False,
+               colors=[color, '#e5e9ee'],
+               wedgeprops=dict(width=0.32, edgecolor='white'))
+        ax.text(0, 0.08, f"{frac * 100:.0f}%", ha='center', va='center',
+                fontsize=18, fontweight='bold', color=color)
+        ax.text(0, -0.22, sub, ha='center', va='center', fontsize=10, color='white')
+        ax.set_title(label, fontsize=12, color='white')
+        ax.set_aspect('equal')
+
+    _fig, _axes = plt.subplots(1, 3, figsize=(11, 3.6))
+    _fig.patch.set_alpha(0.0)
+    for _ax in _axes:
+        _ax.patch.set_visible(False)
+
+    _gauge(_axes[0], _cost / BUDGET, "Budget spent",
+           f"{_cost:,.0f} / {BUDGET:,}", '#7A1E2C')
+    _gauge(_axes[1], _value / _max_value, "Priority value captured",
+           f"{_value} / {_max_value}", '#0B6E6B')
+    _gauge(_axes[2], _n_collected / _n_total, "Supplies collected",
+           f"{_n_collected} / {_n_total}", '#F59E0B')
+
+    plt.tight_layout()
+    _fig
+    return
 
 
 @app.cell
@@ -2113,21 +2268,10 @@ def m34_calibration(
     )
 
     _flip = _calib["last_summary"]["M"] != _calib["last_summary"]["C"]
-    _note = (
-        f"> **The ranking changed at k={_calib['last_k']}.** The best exemplar at the "
-        f"mission budget is **{_calib['last_summary']['M']}**; at the contingency "
-        f"budget it is **{_calib['last_summary']['C']}**. An approach that looks best "
-        f"under one set of conditions is not best under another -- which is exactly "
-        f"why [M3-4] asks for both."
-        if _flip else
-        f"> At k={_calib['last_k']}, **{_calib['last_summary']['M']}** happens to "
-        f"lead at both budgets. Check whether the *size* of the gaps changed, and "
-        f"whether the same is true for your own algorithm."
-    )
 
     mo.vstack([
         mo.md("""
-    ### Calibration sweep -- k = 5 to 15
+    ### Calibration sweep -- k = 5 to 20
 
     For each facility size, the exact optimum and what each exemplar (and your
     algorithm) actually achieved, with the resulting gap below optimum (%).
@@ -2135,13 +2279,7 @@ def m34_calibration(
         mo.md("**Mission budget (60% of full run)**"),
         mo.center(_mission_table),
         mo.md("**Contingency budget (35% of full run)**"),
-        mo.center(_reserve_table),
-        mo.md(_note),
-        mo.md("""
-    > These gaps are the **only** certain statements you can make about solution
-    > quality. Report both in [M3-4] -- and say honestly what they do and do not
-    > tell you about your full facility.
-    """),
+        mo.center(_reserve_table)
     ])
     return
 
@@ -2169,8 +2307,11 @@ def m34_wall_control(mo):
 
 @app.cell
 def m34_wall_run(
+    CACHE_VERSION,
     SUPPLIES,
+    aco_rng_seed,
     exemplar_a_nearest_fill,
+    load_or_compute,
     mo,
     plan_cost,
     plt,
@@ -2178,14 +2319,23 @@ def m34_wall_run(
     time,
     wall_k,
 ):
-    _ks, _secs = [], []
-    for _k in range(8, wall_k.value + 1, 2):
-        _pool = SUPPLIES[:_k]
-        _b = round(plan_cost(exemplar_a_nearest_fill(_pool, float('inf'))) * 0.60)
-        _t0 = time.time()
-        solve_exact(_pool, _b)
-        _secs.append(time.time() - _t0)
-        _ks.append(_k)
+    def _compute_m34_wall(max_k):
+        _ks, _secs = [], []
+        for _k in range(8, max_k + 1, 2):
+            _pool = SUPPLIES[:_k]
+            _b = round(plan_cost(exemplar_a_nearest_fill(_pool, float('inf'))) * 0.60)
+            _t0 = time.time()
+            solve_exact(_pool, _b)
+            _secs.append(time.time() - _t0)
+            _ks.append(_k)
+        return {"ks": _ks, "secs": _secs}
+
+    # Cached per slider value -- moving the slider back to a value you've
+    # already run loads instantly instead of recomputing.
+    _key = {"seed": aco_rng_seed, "wall_k": wall_k.value}
+    _wall = load_or_compute(f"MEMO_3/cache_m34_wall_{wall_k.value}.json", CACHE_VERSION,
+                             _key, lambda: _compute_m34_wall(wall_k.value))
+    _ks, _secs = _wall["ks"], _wall["secs"]
 
     _fig, _ax = plt.subplots(figsize=(6.4, 3.6))
     _ax.semilogy(_ks, [max(s, 1e-4) for s in _secs], marker='o', color='#7A1E2C')
@@ -2275,6 +2425,12 @@ def m34_input(SAVE_FILE_M03, json, mo, os):
 
 
 @app.cell
+def _(mo, resp_m34):
+    mo.callout(mo.md(resp_m34.value), kind="success")
+    return
+
+
+@app.cell
 def m35_header(mo):
     mo.md("""
     ---
@@ -2295,8 +2451,11 @@ def m35_header(mo):
 @app.cell
 def m35_side_by_side(
     BUDGET,
+    CACHE_VERSION,
     SUPPLIES,
     VALUE,
+    aco_rng_seed,
+    load_or_compute,
     memo02_style_plan,
     mo,
     my_algorithm,
@@ -2304,23 +2463,32 @@ def m35_side_by_side(
     plan_value,
     time,
 ):
-    _rows = []
-    for _name, _fn in [("Memo 01/02 approach", memo02_style_plan),
-                       ("Improved (Memo 03)", my_algorithm)]:
-        _t0 = time.time()
-        _p = _fn(SUPPLIES, BUDGET)
-        _ms = (time.time() - _t0) * 1000
-        _rows.append(
-            f"| {_name} | {plan_value(_p)} of {sum(VALUE.values())} | "
-            f"{sum(len(t) for t in _p)} | {len(_p)} | "
-            f"{plan_cost(_p):,.0f} | {_ms:,.2f} ms |")
+    def _compute_m35():
+        _rows = []
+        for _name, _fn in [("Memo 01/02 approach", memo02_style_plan),
+                           ("Improved (Memo 03)", my_algorithm)]:
+            _t0 = time.time()
+            _p = _fn(SUPPLIES, BUDGET)
+            _ms = (time.time() - _t0) * 1000
+            _rows.append({"name": _name, "value": plan_value(_p),
+                           "units": sum(len(t) for t in _p), "trips": len(_p),
+                           "cost": plan_cost(_p), "ms": _ms})
+        return {"rows": _rows}
+
+    _key = {"seed": aco_rng_seed, "budget": BUDGET}
+    _m35 = load_or_compute("MEMO_3/cache_m35.json", CACHE_VERSION, _key, _compute_m35)
+
+    _table_rows = "\n".join(
+        f"| {r['name']} | {r['value']} of {sum(VALUE.values())} | "
+        f"{r['units']} | {r['trips']} | {r['cost']:,.0f} | {r['ms']:,.2f} ms |"
+        for r in _m35["rows"])
 
     mo.md(f"""
     ### Side-by-side analysis
 
     | Algorithm | Priority delivered | Units | Trips | Energy | Wall-clock |
     |---|---|---|---|---|---|
-    {chr(10).join(_rows)}
+    {_table_rows}
 
     Add your **complexity class** for each in the response below, and identify
     the facility size at which exact optimisation ceased to be usable -- that is
@@ -2360,6 +2528,12 @@ def m35_input(SAVE_FILE_M03, json, mo, os):
     )
     resp_m35
     return (resp_m35,)
+
+
+@app.cell
+def _(mo, resp_m35):
+    mo.callout(mo.md(resp_m35.value), kind="success")
+    return
 
 
 @app.cell
@@ -2461,6 +2635,12 @@ def m36_input(SAVE_FILE_M03, json, mo, os):
     )
     resp_m36
     return (resp_m36,)
+
+
+@app.cell
+def _(mo, resp_m36):
+    mo.callout(mo.md(resp_m36.value), kind="success")
+    return
 
 
 @app.cell
