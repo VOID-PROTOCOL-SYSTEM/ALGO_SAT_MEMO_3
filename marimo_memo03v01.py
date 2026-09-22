@@ -31,6 +31,7 @@ def imports():
     return (
         LinearSegmentedColormap,
         SAVE_FILE_M03,
+        animation,
         datetime,
         itertools,
         json,
@@ -1056,7 +1057,7 @@ def _(json, os):
             json.dump({"version": version, "key": key}, f)
         return gif_path
 
-    return
+    return (load_or_render_gif,)
 
 
 @app.cell
@@ -2810,7 +2811,7 @@ def _(nx, random):
 
 
 @app.cell
-def _(itertools, os, random, torch, trainmod):
+def _(itertools, os, random, time, torch, trainmod):
     # Calculator functions that are instance specific to the instance fed into script at initialisation/runtime
     def ext_aco_plan_value(plan, inst):
         return inst["plan_value"](plan)
@@ -3056,7 +3057,10 @@ def _(itertools, os, random, torch, trainmod):
         return current
 
     # Iteration Based ACO
-    def ext_run_iterative_aco(inst, actor, critic, initial_best, n_ants=32, n_iterations=20, evaporation=0.15, elitist_weight=1.5, dist_scale=None, mode="sample", seed=0, use_or_opt=True, use_topup=True):
+    def ext_run_iterative_aco(inst, actor, critic, initial_best, n_ants=32, n_iterations=20,
+                               evaporation=0.15, elitist_weight=1.5, dist_scale=None, mode="sample",
+                               seed=0, use_or_opt=True, use_topup=True,
+                               snapshot_cb=None, time_log=None, start_time=None):
         if dist_scale is None:
             dist_scale = inst["EXIT_LEG"]
 
@@ -3094,8 +3098,16 @@ def _(itertools, os, random, torch, trainmod):
                     global_best_cost = cost
 
             iter_plans.append((ext_copy_plan(global_best), global_best_value))
-            ext_update_pheromone_elite(pheromone, iter_plans, inst["SHAFT"], evaporation, global_best, global_best_value, elitist_weight, inst=inst)
+            ext_update_pheromone_elite(pheromone, iter_plans, inst["SHAFT"], evaporation, global_best,
+                                        global_best_value, elitist_weight, inst=inst)
+
+            if snapshot_cb is not None:
+                snapshot_cb(pheromone, global_best_value)
+            if time_log is not None and start_time is not None:
+                time_log.append((round(time.time() - start_time, 3), global_best_value))
+
         return global_best
+
 
     # Attempt to add uncollected supplies through a new trip, or insertion to existing trip when and if feasible
     def ext_top_up_plan(plan, inst, max_insert_size=3, pool_size=None):
@@ -3266,7 +3278,11 @@ def _(itertools, os, random, torch, trainmod):
         return current
 
     # Multiple Start Hybrid ACO Based Search
-    def ext_hybrid_solve(inst, actor, critic, seed, ants=32, iterations=20, evaporation=0.15, elitist_weight=1.5, mode="sample", use_or_opt=True, use_topup=True, use_final_topup=True, use_swap_search=True):
+    def ext_hybrid_solve(inst, actor, critic, seed, ants=32, iterations=20, evaporation=0.15,
+                          elitist_weight=1.5, mode="sample", use_or_opt=True, use_topup=True,
+                          use_final_topup=True, use_swap_search=True,
+                          snapshot_cb=None, time_log=None):
+        _start_time = time.time()
         torch.manual_seed(seed)
         master_rng = random.Random(seed)
         best = []
@@ -3280,8 +3296,10 @@ def _(itertools, os, random, torch, trainmod):
 
         for restart, cfg in enumerate(configs):
             run_seed = master_rng.randrange(1000000000)
-            candidate = ext_run_iterative_aco(inst, actor, critic, initial_best=best, n_ants=cfg["ants"], n_iterations=cfg["iterations"],
-                evaporation=cfg["evaporation"], elitist_weight=cfg["elitist_weight"], mode=mode, seed=run_seed, use_or_opt=use_or_opt, use_topup=use_topup)
+            candidate = ext_run_iterative_aco(inst, actor, critic, initial_best=best, n_ants=cfg["ants"],
+                n_iterations=cfg["iterations"], evaporation=cfg["evaporation"], elitist_weight=cfg["elitist_weight"],
+                mode=mode, seed=run_seed, use_or_opt=use_or_opt, use_topup=use_topup,
+                snapshot_cb=snapshot_cb, time_log=time_log, start_time=_start_time)
 
             if ext_better_plan(candidate, best, inst):
                 best = ext_copy_plan(candidate)
@@ -4080,6 +4098,467 @@ def _(ext_c2_result, ext_c_result, mo):
 
     {_narrative_c2}
     """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Extension D -- Statistical Rigor on the Checkpoint Comparison
+
+    The 50-seed comparison between the 5k/15k-instance and 40k-instance
+    policy checkpoints (run outside this notebook, via a standalone script
+    that duplicates the canonical pipeline exactly, so the only thing that
+    differs between the two runs on a given seed is which `.pt` file gets
+    loaded) reported near-identical average values by eye: 79.66 vs. 79.70
+    across the 50 seeds. "Near-identical by eye" is not the same as "no
+    real difference", though -- a mean difference that looks small could
+    still be a genuine, reliable effect if the variance across seeds is
+    small enough, so this section replaces the eyeball comparison with a
+    proper statistical test on the actual matched data.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    import statistics as _stats
+    import math as _math
+
+    # Raw per-seed value delivered (checkpoint A = 5k/15k-instance training,
+    # checkpoint B = 40k-instance training), from the 50-seed comparison run
+    # via the standalone compare_checkpoints.py script.
+    _ext_d_data = [
+        (1, 88, 88), (2, 80, 80), (3, 84, 84), (4, 65, 65), (5, 79, 79),
+        (6, 79, 79), (7, 83, 83), (8, 88, 88), (9, 87, 87), (10, 83, 83),
+        (11, 71, 70), (12, 66, 65), (13, 77, 77), (14, 74, 73), (15, 82, 82),
+        (16, 76, 76), (17, 75, 75), (18, 83, 83), (19, 84, 84), (20, 84, 84),
+        (21, 68, 69), (22, 80, 80), (23, 84, 84), (24, 86, 86), (25, 74, 74),
+        (26, 68, 69), (27, 81, 81), (28, 79, 79), (29, 76, 76), (30, 80, 80),
+        (31, 74, 74), (32, 81, 82), (33, 97, 97), (34, 79, 79), (35, 92, 92),
+        (36, 82, 82), (37, 82, 82), (38, 84, 85), (39, 98, 98), (40, 83, 84),
+        (41, 75, 75), (42, 77, 77), (43, 80, 80), (44, 73, 73), (45, 74, 74),
+        (46, 79, 79), (47, 73, 73), (48, 75, 75), (49, 80, 80), (50, 81, 81),
+    ]
+
+    _diffs = [b - a for (_seed, a, b) in _ext_d_data]
+    _n = len(_diffs)
+    _mean_d = _stats.mean(_diffs)
+    _std_d = _stats.stdev(_diffs)
+    _se = _std_d / _math.sqrt(_n)
+    _t_stat = _mean_d / _se if _se > 0 else float('nan')
+    _t_crit = 2.010  # two-tailed, alpha=0.05, df=49
+
+    _sig = abs(_t_stat) > _t_crit
+    _verdict = (
+        f"**Statistically significant** (|t| = {abs(_t_stat):.2f} > {_t_crit})."
+        if _sig else
+        f"**Not statistically significant** (|t| = {abs(_t_stat):.2f} < {_t_crit})."
+    )
+
+    mo.md(f"""
+    | | |
+    |---|---|
+    | n (seeds) | {_n} |
+    | mean difference (40k - 5k) | {_mean_d:+.3f} |
+    | standard deviation of differences | {_std_d:.3f} |
+    | standard error | {_se:.4f} |
+    | t statistic | {_t_stat:.3f} |
+    | critical t (two-tailed, alpha=0.05, df={_n - 1}) | {_t_crit} |
+
+    {_verdict}
+
+    A paired t-test is appropriate here rather than an unpaired (independent
+    two-sample) test, since both checkpoints were run on the *same* 50
+    facility seeds with the *same* RNG seed per comparison -- a
+    matched-pairs design. Working with the 50 per-seed differences (40k
+    result minus 5k result) rather than treating the two checkpoints'
+    scores as two unrelated samples of 50 numbers each is what lets the
+    test detect a real effect even if it's small, because it removes all
+    the seed-to-seed variation (some facilities are just easier or harder
+    than others) that would otherwise swamp the signal in an unpaired
+    comparison. The table above reports: how many seeds went into the test,
+    the mean of those 50 paired differences, how spread out those
+    differences are (standard deviation), the resulting standard error of
+    that mean, the t statistic itself, and the critical value it needs to
+    beat to count as significant at the conventional 5% threshold.
+
+    The result confirms the earlier by-eye read, now with an actual
+    statistical basis rather than an impression: 25,000 additional training
+    instances produced no detectable change in final delivered value. Given
+    Extension C's finding that ACO/RL alone already reaches this facility's
+    ceiling without any help from `TopUp`/`SwapSearch`, the most likely
+    explanation is not that local search is hiding a real difference between
+    the two policies, but that ACO's own broad, multi-restart sampling
+    process is robust enough to reach a similarly good answer regardless of
+    which of these two reasonably-trained policies is steering it.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Extension E -- Hyperparameter Sensitivity: Does `ants` Matter?
+
+    The canonical pipeline uses `ants=32`, `iterations=20` for its first ACO
+    restart config (the other two restarts bump ants/iterations further, see
+    `hybrid_solve`'s `configs` list) without ever having tested whether
+    those specific numbers matter. More ants per iteration means more
+    candidate plans sampled and compared before the pheromone trail updates
+    -- in principle that should mean a better-informed pheromone update and
+    a better final answer, at the direct cost of more `construct_plan` calls
+    (and therefore more wall-clock time) per iteration.
+
+    This sweeps `ants` across 8, 16, 32, 48, and 64 -- holding every other
+    setting (evaporation, elitist weight, iterations, seed) fixed -- and
+    runs the full extension pipeline (`ext_hybrid_solve` with its default
+    four stages) at each value, to see whether the current default of 32
+    ants is doing meaningful work, is already more than enough, or has room
+    to shrink without losing quality.
+    """)
+    return
+
+
+@app.cell
+def _(
+    EXT_CACHE_VERSION,
+    aco_rng_seed,
+    build_inst,
+    ext_aco_plan_cost,
+    ext_aco_plan_value,
+    ext_hybrid_solve,
+    ext_load_policy_for_instance,
+    fac_generator_seed_based,
+    load_or_compute,
+    time,
+):
+    def _compute_ext_e():
+        fac_result = fac_generator_seed_based(23092008)
+
+        _inst = build_inst(fac_result, fac_result["supplies"], budget=float('inf'))
+        _actor, _critic, _ = ext_load_policy_for_instance(_inst, "MEMO_3/")
+
+        _full_plan = ext_exemplar_a_nearest_fill(fac_result["supplies"], budget=float('inf'), inst=_inst)
+        _full_extraction_cost = ext_aco_plan_cost(_full_plan, _inst)
+        _budget = round(_full_extraction_cost * 0.60)
+        _inst["BUDGET"] = _budget
+
+        _rows = []
+        for _ants in [8, 16, 32, 48, 64]:
+            _t0 = time.time()
+            _plan, _source = ext_hybrid_solve(_inst, _actor, _critic, seed=aco_rng_seed, ants=_ants, iterations=20)
+            _ms = (time.time() - _t0) * 1000
+            _rows.append({
+                "ants": _ants,
+                "value": ext_aco_plan_value(_plan, _inst),
+                "runtime_ms": round(_ms, 1),
+            })
+        return {"rows": _rows, "budget": _budget}
+
+    _key = {"seed": 23092008, "ants_values": [8, 16, 32, 48, 64]}
+    ext_e_result = load_or_compute("MEMO_3/cache_ext_e.json", EXT_CACHE_VERSION, _key, _compute_ext_e)
+    return (ext_e_result,)
+
+
+@app.cell
+def _(ext_e_result, mo, plt):
+    _rows = ext_e_result["rows"]
+    _ants = [r["ants"] for r in _rows]
+    _vals = [r["value"] for r in _rows]
+    _times = [r["runtime_ms"] for r in _rows]
+
+    _fig, _axes = plt.subplots(1, 2, figsize=(10, 3.6))
+    _axes[0].plot(_ants, _vals, marker='o', color='#0B6E6B')
+    _axes[0].set_xlabel("ants per iteration")
+    _axes[0].set_ylabel("priority value delivered")
+    _axes[0].set_title("Value vs. ants", fontsize=10)
+    _axes[0].grid(alpha=0.3)
+    _axes[1].plot(_ants, _times, marker='s', color='#7A1E2C')
+    _axes[1].set_xlabel("ants per iteration")
+    _axes[1].set_ylabel("runtime (ms)")
+    _axes[1].set_title("Runtime vs. ants", fontsize=10)
+    _axes[1].grid(alpha=0.3)
+    plt.tight_layout()
+
+    _tbl = "\n".join(f"| {r['ants']} | {r['value']} | {r['runtime_ms']:,.1f} |" for r in _rows)
+    mo.vstack([
+        _fig,
+        mo.md(f"""
+    | ants | value delivered | runtime (ms) |
+    |---|---|---|
+    {_tbl}
+
+    Left panel: priority value delivered against `ants`. Right panel:
+    total wall-clock runtime (the full four-stage pipeline, not just the
+    ACO layer) against the same `ants` values. If value plateaus well
+    before `ants=64`, the current default of 32 has room to shrink without
+    losing quality on this facility, since extra ants beyond the plateau
+    point are pure wasted computation for no quality gain. Runtime should
+    scale roughly linearly with ants, since ants is a fixed constant
+    multiplier on the number of `construct_plan` calls per iteration
+    (consistent with [M3-3]'s O(k^2) bound for the ACO layer, which treats
+    ants as a constant, not a k-dependent term) -- any deviation from a
+    clean straight line in the right panel is a sign that downstream
+    local-search cost (which varies with how much work ACO leaves behind,
+    not with `ants` directly) is adding its own noise on top.
+    """)
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Extension F -- Pheromone Field Evolution
+
+    Pheromone is the shared memory ACO uses to bias future ants toward
+    routes that worked well for past ants -- every edge starts at strength
+    1.0, gets multiplied down by the evaporation rate every iteration, and
+    gets a deposit added back proportional to how good the plans that used
+    it turned out to be. Watching that field change over time is watching
+    the search itself narrow in on a strategy, iteration by iteration.
+
+    This animates the shaft-to-supply pheromone weight specifically (i.e.
+    "how attractive does the policy currently think each unit is as a
+    *first* stop"), across every single ACO iteration of a full
+    `hybrid_solve` run -- all three restarts, back to back, so the field
+    resets and re-grows three times over the course of the animation. Each
+    supply unit is drawn at its real facility position (the same
+    `xoff`/`yoff` transform `draw_facility` uses elsewhere in this
+    notebook), with bubble size fixed to that unit's priority value and
+    bubble colour showing its current pheromone strength on the direct
+    shaft edge. The cell directly below runs a real instrumented
+    `hybrid_solve` against this facility's own seed, with a snapshot hook
+    (`snapshot_cb`) that captures the entire pheromone field once per
+    iteration; the cell after that turns those snapshots into the animation
+    and caches it as a `.gif`.
+    """)
+    return
+
+
+@app.cell
+def _(
+    EXT_CACHE_VERSION,
+    aco_rng_seed,
+    animation,
+    build_inst,
+    ext_aco_plan_cost,
+    ext_aco_plan_value,
+    ext_hybrid_solve,
+    ext_load_policy_for_instance,
+    fac_generator_seed_based,
+    load_or_compute,
+    load_or_render_gif,
+    np,
+    plt,
+    time,
+):
+    def _compute_viz_run():
+        fac_result = fac_generator_seed_based(23092008)
+        _inst = build_inst(fac_result, fac_result["supplies"], budget=float('inf'))
+        _actor, _critic, _ = ext_load_policy_for_instance(_inst, "MEMO_3/")
+
+        _full_plan = ext_exemplar_a_nearest_fill(fac_result["supplies"], budget=float('inf'), inst=_inst)
+        _full_extraction_cost = ext_aco_plan_cost(_full_plan, _inst)
+        _budget = round(_full_extraction_cost * 0.60)
+        _inst["BUDGET"] = _budget
+
+        _snapshots = []
+        _time_log = []
+        _final_pher_holder = {}
+
+        def _snap(pheromone, best_value):
+            _shaft = _inst["SHAFT"]
+            _row = {str(u): pheromone.get((_shaft, u), 1.0) for u in _inst["SUPPLIES"]}
+            _snapshots.append({"best_value": best_value, "shaft_pher": _row})
+            _final_pher_holder["pher"] = pheromone
+
+        _t0 = time.time()
+        _plan, _source = ext_hybrid_solve(_inst, _actor, _critic, seed=aco_rng_seed,
+                                           snapshot_cb=_snap, time_log=_time_log)
+        _elapsed = time.time() - _t0
+        _final_value = ext_aco_plan_value(_plan, _inst)
+
+        _final_pher = _final_pher_holder.get("pher", {})
+        _matrix = [
+            [0.0 if u == v else _final_pher.get((u, v), 0.2) for v in _inst["SUPPLIES"]]
+            for u in _inst["SUPPLIES"]
+        ]
+
+        return {
+            "snapshots": _snapshots,
+            "time_log": _time_log,
+            "elapsed": _elapsed,
+            "final_value": _final_value,
+            "supply_list": [str(u) for u in _inst["SUPPLIES"]],
+            "pheromone_matrix": _matrix,
+            "budget": _budget,
+        }
+
+    _key = {"seed": 23092008, "kind": "viz_instrumented_v1"}
+    viz_run = load_or_compute("MEMO_3/cache_viz_instrumented.json", EXT_CACHE_VERSION,
+                               _key, _compute_viz_run)
+
+    _fac_result_viz = fac_generator_seed_based(23092008)
+    _fac = _fac_result_viz["fac"]
+    _supplies = _fac_result_viz["supplies"]
+    _value = _fac_result_viz["value"]
+
+    _GAP = 3
+    _wc = _fac["wing_cols"]
+
+    def _xoff(w):
+        return w * (_wc + _GAP)
+
+    _xs = np.array([_xoff(u[0]) + u[1] + 0.5 for u in _supplies])
+    _ys = np.array([u[2] + 0.5 for u in _supplies])
+    _sizes = np.array([40 + 55 * _value[u] for u in _supplies])
+    _snaps = viz_run["snapshots"]
+    _sw, _sc_, _sr = _fac["shaft"]
+    _shaft_x, _shaft_y = _xoff(_sw) + _sc_ + 0.5, _sr + 0.5
+
+    def _render_ext_f_gif(_save_path):
+        _fig, _ax = plt.subplots(figsize=(11, 5.5))
+        _fig.patch.set_facecolor('#0b0f14')
+        _ax.set_facecolor('#0b0f14')
+        _ax.set_xlim(_xs.min() - 2, _xs.max() + 2)
+        _ax.set_ylim(_ys.min() - 2, _ys.max() + 2)
+        _ax.set_aspect('equal')
+        _ax.axis('off')
+        _ax.plot(_shaft_x, _shaft_y, marker='*', ms=18, color='#F59E0B', markeredgecolor='white',
+                  markeredgewidth=0.6, zorder=5, label='Shaft (entry/extraction)')
+        _scatter = _ax.scatter(_xs, _ys, s=_sizes, c=np.ones(len(_xs)), cmap="viridis",
+                                vmin=0.2, vmax=6.0, edgecolors='#1a1f26', linewidths=0.4, zorder=4)
+        _title = _ax.set_title("", color='#39ff88', fontsize=12)
+        _ax.legend(loc='upper right', fontsize=8, facecolor='#0b0f14', edgecolor='#39424e', labelcolor='white')
+        _cbar = _fig.colorbar(_scatter, ax=_ax, fraction=0.025, pad=0.02)
+        _cbar.set_label('pheromone: shaft -> supply', color='white', fontsize=8)
+        _cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(plt.getp(_cbar.ax.axes, 'yticklabels'), color='white')
+        plt.tight_layout()
+
+        def _update(frame):
+            frame = min(frame, len(_snaps) - 1)
+            _row = _snaps[frame]["shaft_pher"]
+            _vals = np.array([_row[str(u)] for u in _supplies])
+            _scatter.set_array(_vals)
+            _title.set_text(
+                f"Pheromone on shaft->supply edges  |  iteration "
+                f"{frame + 1}/{len(_snaps)}  |  best value so far: "
+                f"{_snaps[frame]['best_value']}"
+            )
+            return _scatter, _title
+
+        _ani = animation.FuncAnimation(_fig, _update, frames=len(_snaps) + 20, interval=160, blit=False)
+        _ani.save(_save_path, writer=animation.PillowWriter(fps=6))
+        plt.close(_fig)
+
+    ext_f_gif_path = load_or_render_gif(
+        "MEMO_3/extras_assets/pheromone_evolution.gif", EXT_CACHE_VERSION,
+        {"kind": "ext_f_pheromone_evolution", "n_iters": len(_snaps), "hold_frames": 20},
+        _render_ext_f_gif,
+    )
+    return ext_f_gif_path, viz_run
+
+
+@app.cell
+def _(ext_f_gif_path, mo):
+    mo.vstack([
+        mo.image(src=ext_f_gif_path,
+                  alt="Pheromone field evolution across all ACO iterations"),
+        mo.md("""
+    The title above the animation tracks the iteration number and the best
+    plan value found so far, so you can see quality improve at the same
+    time as the field itself changes shape. Watch the field flatten early
+    (evaporation dominating, since nothing has been reinforced yet), then
+    sharpen around a stable core of high-value, short-hop nodes as elitist
+    reinforcement starts to dominate evaporation once good plans are being
+    found repeatedly -- and watch it reset and re-sharpen three separate
+    times, once per ACO restart, since each restart in `hybrid_solve`
+    begins with a completely fresh pheromone table rather than continuing
+    the previous restart's. Every bubble sits at that supply unit's real
+    facility position and is sized by its fixed priority value, so the
+    *positions* never move -- only the colours change as the run proceeds.
+    """)
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Extension G -- Anytime Behaviour: Value vs. Wall-Clock Time
+
+    An "anytime" algorithm is one that always has *some* valid answer ready,
+    with quality improving the longer it's allowed to keep running --
+    exactly the shape of `hybrid_solve`'s output, since `global_best` is
+    tracked and updated continuously rather than only being produced right
+    at the end. This section asks the practical question that shape
+    implies: if the run had been cut off early -- deadline pressure, a
+    battery running low, whatever the reason -- what value would have
+    actually been on hand at that moment?
+
+    It reuses the exact same instrumented run as Extension F (`viz_run`,
+    computed once and shared between both sections), but reads a different
+    field from it: `time_log`, a list of `(elapsed_seconds, best_value_so_far)`
+    pairs recorded after every single ant in the run, not just at the end.
+    Plotting that against wall-clock time (rather than iteration count, which
+    Extension F's animation already covers) shows how quickly the search
+    actually converges in real time, and how much of the total run is spent
+    finding the answer versus how much is spent merely confirming nothing
+    better exists. This is a static chart rather than an animation, so its
+    computation and display live together in one cell.
+    """)
+    return
+
+
+@app.cell
+def _(mo, np, plt, viz_run):
+    _log = viz_run["time_log"]
+    _ts = np.array([row[0] for row in _log])
+    _vs = np.array([row[1] for row in _log])
+
+    _fig, _ax = plt.subplots(figsize=(7, 4.2))
+    _ax.step(_ts, _vs, where='post', color='#0B6E6B', lw=1.6)
+    _ax.fill_between(_ts, _vs, step='post', color='#0B6E6B', alpha=0.15)
+    _ax.axhline(viz_run["final_value"], color='#7A1E2C', ls='--', lw=1,
+                label=f"final value = {viz_run['final_value']}")
+    _ax.set_xlabel("elapsed wall-clock time (s)")
+    _ax.set_ylabel("best plan value found so far")
+    _ax.set_title("Anytime behaviour -- this facility, this run", fontsize=10)
+    _ax.legend(fontsize=8)
+    _ax.grid(alpha=0.3)
+    plt.tight_layout()
+
+    _t_reach_final = next((t for (t, v) in _log if v >= viz_run["final_value"]),
+                           viz_run["elapsed"])
+    mo.vstack([
+        _fig,
+        mo.md(f"""
+    The step line is the best plan value found *so far* at every recorded
+    moment in time -- it can only ever go up or stay flat, never down,
+    since `global_best` is only ever replaced by something strictly better.
+    The shaded area under the line is just a visual aid to make the
+    "already-locked-in" value at any point in time easier to read at a
+    glance; the dashed horizontal line marks the run's actual final value
+    for reference. Generated fresh from the same run as the Extension F
+    animation above, so the two are directly comparable frame-for-frame if
+    you want to line up a jump in this chart with a moment in that
+    animation.
+
+    This run reached its final value of **{viz_run['final_value']}** at
+    **{_t_reach_final:.1f}s**, out of **{viz_run['elapsed']:.1f}s** total
+    wall-clock time -- meaning roughly {100 * _t_reach_final / viz_run['elapsed']:.0f}%
+    of the run's total time was spent finding the answer, and the remaining
+    {100 * (1 - _t_reach_final / viz_run['elapsed']):.0f}% was spent on the
+    later ACO restarts, top-up, and swap-search *confirming* nothing better
+    exists, rather than on genuine search difficulty. That's a useful
+    number in its own right: it says that if this run were deadline-bound
+    and cut off at `_t_reach_final` seconds instead of running to
+    completion, the delivered value would have been identical.
+    """)
+    ])
     return
 
 
