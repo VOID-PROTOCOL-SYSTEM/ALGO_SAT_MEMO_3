@@ -1,22 +1,3 @@
-"""
-train_hybrid_aco_policies.py
-
-Standalone (non-marimo) training script for Operation Emberlight / Memo 03.
-
-Trains THREE separate actor-critic policies -- one per facility size
-(n_wings = 2, 3, 4) -- using multiprocessing to parallelize rollout
-collection across CPU cores.
-
-Everything is module-level (not nested inside a function) so it can be
-pickled and shipped to worker processes by multiprocessing.Pool.
-
-Output: three checkpoint files, policy_wings2.pt / policy_wings3.pt /
-policy_wings4.pt, each containing an actor + critic state_dict.
-
-Usage:
-    python train_hybrid_aco_policies.py --instances 1500 --ants 16 --workers 6
-"""
-
 import argparse
 import itertools
 import multiprocessing as mp
@@ -25,12 +6,6 @@ import random as pyrandom
 import networkx as nx
 import torch
 import torch.nn as nn
-
-
-# ============================================================
-# 1. Facility generator (identical to the Memo 01/02/03 maze;
-#    do not change -- must stay bit-for-bit reproducible per seed)
-# ============================================================
 
 WING_COLS, WING_ROWS = 10, 10
 N_SUPPLIES = 30
@@ -148,10 +123,6 @@ def get_facility(seed):
                 supplies=supplies, masses=masses, values=values, capacity=CAPACITY)
 
 
-# ============================================================
-# 2. Instance wrapper: seed -> full cost-model closure bundle
-# ============================================================
-
 def best_order(units, trip_cost):
     if len(units) <= 1:
         return list(units)
@@ -237,11 +208,6 @@ def seed_for_wings(rng, n_wings):
         if s % 3 == target_mod:
             return s
 
-
-# ============================================================
-# 3. Actor / Critic networks
-# ============================================================
-
 class Actor(nn.Module):
     def __init__(self, in_dim=7, hidden=64):
         super().__init__()
@@ -267,12 +233,6 @@ class Critic(nn.Module):
     def forward(self, feats):
         return self.net(feats).squeeze(-1)
 
-
-# ============================================================
-# 4. Features (distance-normalized so a policy generalizes across
-#    the many different seeds *within* its own wing-count bucket)
-# ============================================================
-
 def candidate_features(here, cand, load, cap, spent, budget, dist, mass_of, value_of,
                         pheromone, n_remaining, n_total, dist_scale):
     if cand == "STOP":
@@ -296,15 +256,6 @@ def state_features(spent, budget, load, cap, remaining, value_of, mass_of, n_tot
                 if remaining else 0.0)
     return [spent / max(budget, 1e-9), load / cap, len(remaining) / max(n_total, 1),
             mean_vpm / 5.0]
-
-
-# ============================================================
-# 5. Rollout construction
-#    - "collect_raw" mode (used inside worker processes): NO autograd,
-#      just records which candidate was chosen at each decision so the
-#      main process can replay it through the live network with grad on.
-#    - "greedy" mode (used at eval/inference time): argmax, no sampling.
-# ============================================================
 
 def construct_plan(inst, actor, critic, pheromone, dist_scale, mode="sample"):
     """mode: 'sample' (stochastic, records a raw trajectory for later replay),
@@ -382,11 +333,6 @@ def update_pheromone(pheromone, iter_plans, shaft, evaporation, elite_plan, elit
                 here = u
             pheromone[(here, "STOP")] = pheromone.get((here, "STOP"), 1.0) + elitist_weight * (elite_value / 100.0)
 
-
-# ============================================================
-# 6. Worker function (must be module-level to be picklable by Pool)
-# ============================================================
-
 def rollout_worker(args):
     seed, actor_state, critic_state, n_ants, n_waves = args
     torch.set_num_threads(1)  # avoid thread oversubscription across processes
@@ -406,16 +352,6 @@ def rollout_worker(args):
     all_plans = []          # list of (plan, raw_value), across ALL waves -- for the group-relative baseline
     total_value = max(sum(inst['VALUE'].values()), 1)
 
-    # ---- FIX: multi-wave pheromone. Previously pheromone was reset to {}
-    # and passed UNCHANGED to every ant, then update_pheromone was only
-    # called once at the very end -- so every single decision, in every
-    # episode, saw a constant pheromone value of 1.0. It never carried any
-    # real information during training. Splitting n_ants into a few waves
-    # and updating pheromone BETWEEN waves means later waves in the same
-    # instance actually see the accumulated signal, closer to how the
-    # original ACO's pheromone was meant to work. It still can't transfer
-    # across instances (each episode is a new facility), but at least it's
-    # no longer dead weight within an episode.
     ants_per_wave = max(n_ants // n_waves, 1)
     for wave in range(n_waves):
         wave_plans = []
@@ -434,19 +370,9 @@ def rollout_worker(args):
 
     best_plan, best_value = max(all_plans, key=lambda pv: pv[1]) if all_plans else ([], 0)
 
-    # group-relative baseline: mean normalized return across every ant that
-    # ran in THIS instance. Much lower variance than the critic alone,
-    # since it's an apples-to-apples same-instance comparison rather than
-    # a learned approximation -- standard trick in neural combinatorial
-    # optimization (e.g. POMO-style shared baselines).
     group_mean = (sum(v for _, v in all_plans) / len(all_plans) / total_value) if all_plans else 0.0
 
     return trajectories, best_plan, best_value, seed, group_mean
-
-
-# ============================================================
-# 7. Main training loop for ONE wing-count bucket
-# ============================================================
 
 def evaluate(actor, critic, val_seeds):
     """Greedy rollout on held-out seeds -- no gradient, just a sanity score."""
@@ -464,13 +390,6 @@ def evaluate(actor, critic, val_seeds):
 def train_policy_for_wing_count(n_wings, n_instances, n_ants, n_workers, lr, seed, out_path,
                                  n_waves=4, entropy_start=0.05, entropy_end=0.005,
                                  baseline_blend=0.5):
-    """
-    baseline_blend: 0.0 = pure critic baseline, 1.0 = pure group-relative
-    baseline, values in between blend the two. Default 0.5 splits the
-    difference -- the critic still learns (needed for anything that isn't
-    well-approximated by a same-instance mean), but the lower-variance
-    group-relative signal does a lot of the heavy lifting early on.
-    """
     print(f"\n=== Training policy for n_wings = {n_wings} ===")
     rng = pyrandom.Random(seed)
     torch.manual_seed(seed)
@@ -493,15 +412,9 @@ def train_policy_for_wing_count(n_wings, n_instances, n_ants, n_workers, lr, see
             args = [(s, actor_state, critic_state, n_ants, n_waves) for s in seeds_batch]
 
             results = pool.map(rollout_worker, args)
-
-            # entropy coefficient anneals linearly from entropy_start down to
-            # entropy_end over the course of training: more exploration
-            # early, sharper policy later.
             frac = step / max(n_steps - 1, 1)
             entropy_coef = entropy_start + (entropy_end - entropy_start) * frac
 
-            # ---- replay recorded trajectories through the LIVE network
-            #      (with grad on) to compute the actual policy-gradient loss ----
             total_loss = torch.tensor(0.0)
             n_traj = 0
             for trajectories, _, _, _, group_mean in results:
@@ -527,8 +440,7 @@ def train_policy_for_wing_count(n_wings, n_instances, n_ants, n_workers, lr, see
                     entropy_t = torch.stack(entropies).mean()
 
                     actor_loss = -(log_probs_t * advantage).sum()
-                    # critic still trained against the real return regardless
-                    # of how much the blend uses it for the advantage
+
                     critic_loss = nn.functional.mse_loss(values, returns)
                     total_loss = total_loss + actor_loss + 0.5 * critic_loss - entropy_coef * entropy_t
 
@@ -550,11 +462,6 @@ def train_policy_for_wing_count(n_wings, n_instances, n_ants, n_workers, lr, see
                 'n_wings': n_wings}, out_path)
     print(f"  saved -> {out_path}")
     return actor, critic
-
-
-# ============================================================
-# 8. Entry point
-# ============================================================
 
 def main():
     parser = argparse.ArgumentParser()
@@ -594,8 +501,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # 'spawn' is the safest start method across platforms (required on
-    # Windows/macOS, recommended everywhere) when workers create their
-    # own torch tensors.
     mp.set_start_method("spawn", force=True)
     main()

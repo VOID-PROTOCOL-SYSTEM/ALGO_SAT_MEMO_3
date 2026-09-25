@@ -1341,14 +1341,11 @@ def m31_student_algorithm(
                             for seg_variant in (segment, list(reversed(segment))):
                                 for pos in range(len(dst_base) + 1):
                                     if dst_i == src_i and pos == start:
-                                        continue  # no-op, same position
+                                        continue 
 
                                     new_dst = dst_base[:pos] + seg_variant + dst_base[pos:]
                                     new_dst_cost = trip_cost(new_dst)
 
-                                    # Delta cost: only the affected trip(s) changed --
-                                    # everything else in the plan is untouched, so
-                                    # there's no need to re-sum the whole plan.
                                     if dst_i == src_i:
                                         cand_cost = current_cost - src_trip_cost + new_dst_cost
                                     else:
@@ -1406,8 +1403,8 @@ def m31_student_algorithm(
                 plan_for_ant = raw_plan if valid else []
 
                 if plan_for_ant:
-                    plan_for_ant = or_opt_plan(plan_for_ant, inst, max_segment=3)   # <-- new: cheap routing polish
-                    plan_for_ant = top_up_plan(plan_for_ant, inst, max_insert_size=2)  # now has freed budget to spend
+                    plan_for_ant = or_opt_plan(plan_for_ant, inst, max_segment=3) 
+                    plan_for_ant = top_up_plan(plan_for_ant, inst, max_insert_size=2) 
 
                 value = aco_plan_value(plan_for_ant, inst)
                 raw_values.append(value)
@@ -1887,7 +1884,7 @@ def _(mo, resp_m32):
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    #### S3-B Side Memo
+    ## S3-B Side Memo
     """)
     return
 
@@ -2431,6 +2428,313 @@ def _(mo, resp_m34):
     return
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## SIDE MEMO S3-C
+    """)
+    return
+
+
+@app.cell
+def _(
+    CACHE_VERSION,
+    EXIT_LEG,
+    MASS,
+    SHAFT,
+    SUPPLIES,
+    VALUE,
+    aco_rng_seed,
+    dist,
+    exemplar_a_nearest_fill,
+    itertools,
+    load_or_compute,
+    mo,
+    my_algorithm,
+    pd,
+    plan_cost,
+    plan_value,
+):
+    def held_karp_order(units, shaft, dist_fn, mass_dict):
+        n = len(units)
+        if n <= 1:
+            return list(units)
+
+        idx = list(units)
+        full = (1 << n) - 1
+
+        load_of = {
+            mask: sum(mass_dict[idx[i]] for i in range(n) if mask & (1 << i))
+            for mask in range(1, full + 1)
+        }
+
+        dp = {}
+        parent = {}
+
+        for i in range(n):
+            m = 1 << i
+            dp[(m, i)] = dist_fn(shaft, idx[i])
+            parent[(m, i)] = None
+
+        for mask in range(1, full + 1):
+            for i in range(n):
+                if not (mask & (1 << i)) or (mask, i) not in dp:
+                    continue
+
+                load_after_mask = load_of[mask]
+
+                for j in range(n):
+                    if mask & (1 << j):
+                        continue
+
+                    new_mask = mask | (1 << j)
+                    cost = dp[(mask, i)] + (1 + load_after_mask) * dist_fn(idx[i], idx[j])
+                    key = (new_mask, j)
+
+                    if key not in dp or cost < dp[key]:
+                        dp[key] = cost
+                        parent[key] = (mask, i)
+
+        best_end, best_cost = None, float("inf")
+        for i in range(n):
+            key = (full, i)
+            if key not in dp:
+                continue
+            total = dp[key] + (1 + load_of[full]) * dist_fn(idx[i], shaft)
+            if total < best_cost:
+                best_cost, best_end = total, i
+
+        order, key = [], (full, best_end)
+        while key is not None:
+            mask, i = key
+            order.append(idx[i])
+            key = parent[key]
+        order.reverse()
+        return order
+
+    def solve_exact_relaxed(pool, budget, relaxed_cap, max_bundle, MASS, VALUE, EXIT_LEG, SHAFT, dist):
+        k = len(pool)
+        idx = {u: i for i, u in enumerate(pool)}
+
+        def bundle_cost(combo):
+            order = held_karp_order(list(combo), SHAFT, dist, MASS)
+            here, total, load = SHAFT, 0.0, 0
+            for u in order:
+                total += (1 + load) * dist(here, u)
+                load += MASS[u]
+                here = u
+            total += (1 + load) * dist(here, SHAFT)
+            return total, order
+
+        bundles, bundle_orders = {}, {}
+        for size in range(1, max_bundle + 1):
+            for combo in itertools.combinations(pool, size):
+                if sum(MASS[u] for u in combo) > relaxed_cap:
+                    continue
+                m = 0
+                for u in combo:
+                    m |= 1 << idx[u]
+                cost, order = bundle_cost(combo)
+                bundles[m] = cost
+                bundle_orders[m] = order
+
+        by_low = {}
+        for b, c in bundles.items():
+            by_low.setdefault(b & -b, []).append((b, c))
+
+        INF = float("inf")
+        best = [INF] * (1 << k)
+        best[0] = 0.0
+        for mask in range(1, 1 << k):
+            low = mask & -mask
+            m = INF
+            for b, c in by_low.get(low, ()):
+                if b & mask == b:
+                    prev = best[mask ^ b]
+                    if prev < INF and prev + c < m:
+                        m = prev + c
+            best[mask] = m
+
+        cap_energy = budget - EXIT_LEG
+        bv, bm = 0, 0
+        for mask in range(1 << k):
+            if best[mask] <= cap_energy:
+                v = 0
+                mm = mask
+                while mm:
+                    v += VALUE[pool[(mm & -mm).bit_length() - 1]]
+                    mm &= mm - 1
+                if v > bv or (v == bv and best[mask] < best[bm]):
+                    bv, bm = v, mask
+
+        chosen, mask = [], bm
+        while mask:
+            low = mask & -mask
+            for b, c in by_low.get(low, ()):
+                if b & mask == b and abs(best[mask] - (best[mask ^ b] + c)) < 1e-9:
+                    chosen.append(bundle_orders[b])
+                    mask ^= b
+                    break
+            else:
+                break
+
+        return bv, chosen, best[bm] + EXIT_LEG, len(bundles)
+
+    _K_TESTS = list(range(10, 16))
+    _BUDGET_PROPS = [("Mission", 0.60), ("Contingency", 0.35)]
+    _MAX_BUNDLE = 15  
+    _RELAXED_CAP = 200.0 
+
+    def _compute_ext_relaxed_bound():
+        _results = []
+
+        for _k_test in _K_TESTS:
+            _pool = SUPPLIES[:_k_test]
+            _full_cost = plan_cost(exemplar_a_nearest_fill(_pool, float("inf")))
+
+            for _budget_label, _budget_prop in _BUDGET_PROPS:
+                _budget = round(_full_cost * _budget_prop)
+
+                _heuristic_plan = my_algorithm(_pool, _budget)
+                _heuristic_value = plan_value(_heuristic_plan)
+
+                _bound_value, _chosen_bundles, _bound_cost, _n_bundles = solve_exact_relaxed(
+                    _pool, _budget, relaxed_cap=_RELAXED_CAP, max_bundle=_MAX_BUNDLE,
+                    MASS=MASS, VALUE=VALUE, EXIT_LEG=EXIT_LEG, SHAFT=SHAFT, dist=dist,
+                )
+
+                assert _bound_cost <= _budget + 1e-6, (
+                    f"Relaxed exact solution exceeds budget at "
+                    f"k={_k_test}, {_budget_label}: {_bound_cost} > {_budget}"
+                )
+                assert _bound_value >= _heuristic_value, (
+                    f"Bound fell below the heuristic at "
+                    f"k={_k_test}, {_budget_label}: bound={_bound_value} "
+                    f"< heuristic={_heuristic_value} -- relaxation is invalid, stop and check"
+                )
+
+                _bundle_sizes = [len(b) for b in _chosen_bundles]
+                _saturated = bool(_bundle_sizes) and max(_bundle_sizes) == _MAX_BUNDLE
+                _gap_pct = (
+                    100.0 * (_bound_value - _heuristic_value) / _bound_value
+                    if _bound_value > 0 else 0.0
+                )
+
+                _results.append({
+                    "budget_label": _budget_label,
+                    "k": _k_test,
+                    "budget": _budget,
+                    "heuristic_value": _heuristic_value,
+                    "bound_value": _bound_value,
+                    "bound_vs_heuristic": _bound_value - _heuristic_value,
+                    "gap_pct": round(_gap_pct, 2),
+                    "bound_cost": round(_bound_cost, 1),
+                    "n_bundles": _n_bundles,
+                    "bundle_sizes": _bundle_sizes,
+                    "saturated": _saturated,
+                })
+
+        return {"rows": _results}
+
+    _key = {
+        "seed": aco_rng_seed,
+        "k_range": [_K_TESTS[0], _K_TESTS[-1]],
+        "budget_props": [p for _, p in _BUDGET_PROPS],
+        "max_bundle": _MAX_BUNDLE,
+        "relaxed_cap": _RELAXED_CAP,
+        "kind": "ext_relaxed_capacity_bound",
+    }
+    _cached = load_or_compute(
+        "MEMO_3/cache_ext_relaxed_bound.json", CACHE_VERSION, _key,
+        _compute_ext_relaxed_bound,
+    )
+
+    ext_k_df = pd.DataFrame(_cached["rows"])
+    _mission_df = ext_k_df[ext_k_df["budget_label"] == "Mission"]
+    _contingency_df = ext_k_df[ext_k_df["budget_label"] == "Contingency"]
+
+    mo.vstack([
+        mo.md(f"""
+    ### Relaxed-capacity exact bound across k=10-15, both budgets
+
+    The same facility instance and budget convention as the M3-4 calibration
+    sweep is evaluated at each pool size, under both the mission (60%) and
+    contingency (35%) budgets. The hybrid solution is compared against the
+    exact capacity-relaxed bound for that same `k` and budget.
+
+    **Mission:** mean gap {_mission_df['gap_pct'].mean():.2f}%, worst case {_mission_df['gap_pct'].max():.2f}%
+    **Contingency:** mean gap {_contingency_df['gap_pct'].mean():.2f}%, worst case {_contingency_df['gap_pct'].max():.2f}%
+    """),
+
+        mo.ui.table(
+            ext_k_df[[
+                "budget_label", "k", "budget", "heuristic_value", "bound_value",
+                "bound_vs_heuristic", "gap_pct", "bound_cost", "n_bundles",
+                "bundle_sizes", "saturated",
+            ]],
+            selection=None,
+            page_size=20
+        ),
+    ])
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Response:
+
+    On the full k = 30 facility, the optimum is never known. This means that any quality claim regarding my solution must be made through comparisons rather than a single number. I used all three techniques described by the side memo, with each targeting a differing weakness of the others.
+
+    #### Ground truth on a smaller instance:
+
+    The exact DP solver stays tractable up to k = 16 to 20 depending on which benchmark I run (0.378s at k=16 and so extrapolation shows k = 30 to be around 6.9 hours). As this isn't practical, I scaled the facility down and then made comparisons. Across k = 5 to 20, under both the mission and contingency budgets, my algorithm matches the exact optimum in all 32/32 tested cases — a 0% gap at every tested k, on both budgets (calibration sweep). That's stronger than expected but still isn't a proof since a perfect record at k = 20 doesn't guarantee that the same will occur at k = 30, as the search space grows exponentially, while the heuristic's own structure (fixed feature vector, bounded local search) doesn't scale. So I treat near certain optimality at k = 30 as an assumption instead of a conclusion the data at k <= 20 proves.
+
+    #### Bounding from the other side:
+
+    Separate to earlier tests, I constructed an upper bound by relaxing the constraint that makes trip grouping hard - removing the capacity limit entirely means any subset of supplies affordable under the budget can be collected however is preferable without the added restriction that a single trip can't exceed the shuttle's real capacity. Because dropping a constraint can only let the solver do as well or better than the true capacity-limited problem, the resulting value is provably >= the true optimum. Across k = 10 to 15 (as shown in the data table above), under both the mission and contingency budgets, this relaxed bound matched my heuristic's delivered value exactly in 6 of 12 tested cases (50%), with the remaining gaps ranging from 2.94% to 7.69% (an overall average of 2.29%). The contingency budget is consistently looser than mission (average of 2.98% vs 1.60%). This is consistent with the pattern already visible: that a tighter budget leaves less slack between the relaxed and real-capacity solutions.
+
+    #### Agreement between independent methods:
+
+    Finally, the stage ablation results show three structurally different components — ACO/RL search, Or-opt local search, TopUp/SwapSearch combinatorial insertion — converging on the same total value, with TopUp and SwapSearch adding nothing further once Or-opt is in the loop (these results are shown below in Extension C). That agreement between methods built on different principles (learned policy vs. deterministic local search vs. exhaustive small-neighbourhood search) is weak evidence on its own, but it points in a different direction than either of the first two techniques: it doesn't depend on scaling down the problem or relaxing a constraint, it depends on independently-derived answers not contradicting each other.
+
+    #### What doesn't count as a measurement:
+
+    Saying that the algorithm delivered a good result, on its own says nothing, as it doesn't clarify whether more could be reached within budget by another method. Every number above is a comparison, whether it be against a smaller exact solution, against a relaxed bound, or against an alternative. Each on their own isn't enough since the calibration sweep spans 16 different k values under two budgets, and the relaxed bound spans six k values under two budgets, making one convenient measurement unable to justify the whole picture.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## SIDE MEMO S3-D
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    #### Count the candidate solutions:
+
+    At the full facility, k = 30, every subset of the 30 supply units is a candidate extraction set, and this is well before deciding how to group them into trips and before order them within a trip: 2^30 = 1.07 billion subsets. That count comes before any consideration of trip grouping or route ordering (permutations/combinations) and so is the floored value of search space size an exact method has, but isn't the full space.
+
+    #### The count, not just the runtime, is the argument:
+
+    My laptop measurements show k = 8 solving in about 0.001 seconds and k = 20 in 15.785 seconds. This represents a slowdown of roughly 5.0x per two additional units, and is steeper than pure 2^k as bundle formation adds its own k-dependent overhead on top. Extrapolating that growth rate (log-linear fit across all five measured points) to my full k = 30 instance gives roughly 17,898 days (almost 49 years) to solve which is clearly infeasible for anything approaching real world use. While the extrapolation is based off measured values up to k = 20, and so can't be taken with complete certainty, what remains true is the subset count itself — 2^30 candidate states is a fact about the problem, not an artifact of machine speed, and that's the part of the argument that survives "just buy a faster computer". A 100x faster machine only buys about 6–7 more supply units before it hits the same bottleneck, since the thing growing is the number of states that must be examined, and this isn't an implementation inefficiency.
+
+    #### Name the structure:
+
+    This is knapsack shaped. Choosing a subset of supplies under a budget ceiling, while maximising collected value, is 0/1 knapsack, for which the only known exact algorithms are exponential in item count (supplies in this case). On top of this, grouping chosen units into capacity limited trips is bin packing shaped, and choosing the order within each trip to minimise cost is a small tour construction problem, best done thorough permutations on this smaller set. Since this problem is NP-hard in every major aspect, this makes this an intractability argument rather than a performance complaint.
+
+    #### Say what I gave up, and why that trade is justified here:
+
+    Giving up the exact solver's guarantee of optimality is the direct price of a heuristic implementation approach for the benefit of termination in seconds rather than years/decades. However, it is only justifiable if the trade still results in good enough answers such that the algorithm can be trusted for good answers. This is done through the two independent checks above: a 32/32 exact match record against ground truth across k = 5 to 20, and a relaxed-capacity upper bound that the heuristic matched in half of the twelve tested cases, trailing by at most 5.41% under the mission budget and 7.69% under the tighter contingency (battery) budget. This trade of optimality for time complexity is especially valuable in the contingency plan scenario, where a draining battery in a drone requires a fast, good enough, answer instead of a confirmed best case answer that might arrive hours later or at a time where the problem no longer matters (years/decades later).
+    """)
+    return
+
+
 @app.cell
 def m35_header(mo):
     mo.md("""
@@ -2653,13 +2957,17 @@ def _(mo):
 
     The sections below follow on from findings made while constructing [M3-1] through to [M3-6]. It includes a specific complexity bottleneck identified in [M3-3], a checkpoint comparison run outside this notebook, and open questions about how much of the final delivered value actually comes from the learned actor-critic ACO policy versus the deterministic search stages that follow it.
 
-    Every section below reconstructs the pieces of the pipeline it needs locally, in its own helper cell, rather than modifying `my_algorithm` directly. Nothing above this point is ever used.
+    Every section below reconstructs the pieces of the pipeline it needs locally, in its own helper cell, rather than modifying `my_algorithm` directly. Nothing above this point is used.
+
+    Further, the below sections are precomputed and read saved json cache from the project directory in order to save runtime which collectively is in excess of 2 hours.
     """)
     return
 
 
 @app.cell
 def _(nx, random):
+    # Your fac geneator scripts all put under a single overhead function to be used below for fac generations that aren't my seed
+
     def fac_generator_seed_based(seed):
         WING_COLS, WING_ROWS = 10, 10
         N_SUPPLIES = 30
@@ -2813,6 +3121,7 @@ def _(nx, random):
 @app.cell
 def _(itertools, os, random, time, torch, trainmod):
     # Calculator functions that are instance specific to the instance fed into script at initialisation/runtime
+    # Allows the script to run on any input fac based from generation above
     def ext_aco_plan_value(plan, inst):
         return inst["plan_value"](plan)
 
@@ -2978,7 +3287,7 @@ def _(itertools, os, random, time, torch, trainmod):
         for key in pheromone:
             pheromone[key] = min(max(pheromone[key], min_pheromone), max_pheromone)
 
-    # FIXED: every _trip_cost(...) call below replaced with the inst-bound trip_cost(...)
+    # Or-opt run for every ant during ACO
     def ext_or_opt_plan(plan, inst, max_segment=3, first_improvement=True):
         CAP = inst["CAP"]
         BUDGET = inst["BUDGET"]
@@ -3017,7 +3326,7 @@ def _(itertools, os, random, time, torch, trainmod):
                             for seg_variant in (segment, list(reversed(segment))):
                                 for pos in range(len(dst_base) + 1):
                                     if dst_i == src_i and pos == start:
-                                        continue  # no-op, same position
+                                        continue
 
                                     new_dst = dst_base[:pos] + seg_variant + dst_base[pos:]
                                     new_dst_cost = trip_cost(new_dst)
@@ -3283,7 +3592,6 @@ def _(itertools, os, random, time, torch, trainmod):
                           use_final_topup=True, use_swap_search=True,
                           snapshot_cb=None, time_log=None):
         _start_time = time.time()
-        torch.manual_seed(seed)
         master_rng = random.Random(seed)
         best = []
         best_source = "empty seed"
@@ -3389,6 +3697,9 @@ def _(itertools, os, random, time, torch, trainmod):
 
 
 @app.function
+# As used everywhere else in the project, the below heuristic is used to find what it would need for complete collection and then takes 60% or 35% to define fac budget
+# So is used to define budget for any new fac generated
+
 def ext_exemplar_a_nearest_fill(pool, budget, inst):
     """A -- pack whatever is closest, ignore priority entirely."""
     SHAFT = inst["SHAFT"]
@@ -3487,7 +3798,7 @@ def _(
         for k in ks:
             row = {"k": k}
             pool_k = fac_resultt["supplies"][:k]
-        
+
             inst_k = build_inst(fac_resultt, pool_k, budget=float('inf'))
             full_plan_k = ext_exemplar_a_nearest_fill(pool_k, budget=float('inf'), inst=inst_k)
             full_cost_k = ext_aco_plan_cost(full_plan_k, inst_k)
@@ -3762,6 +4073,7 @@ def _(
     my_algorithm,
     plan_value,
     time,
+    torch,
 ):
     def _compute_ext_b():
         _rows = []
@@ -3800,6 +4112,7 @@ def _(
     _fac_result = fac_generator_seed_based(_fac_seed)
 
     _inst = build_inst(_fac_result, _fac_result["supplies"], budget=float('inf'))
+    torch.manual_seed(aco_rng_seed)
     _actor, _critic, _ = ext_load_policy_for_instance(inst=_inst, checkpoint_dir="MEMO_3/")
 
     _full_plan = ext_exemplar_a_nearest_fill(_fac_result["supplies"], budget=float('inf'), inst=_inst)
@@ -3855,11 +4168,11 @@ def _(ext_b2_result, ext_b_result, mo):
     |---|---|---|---|---|---|
     {_tbl_b2}
 
-    Finding: harsher budget consistently means more uncollected supplies, but not slower runtime. Both facilities show uncollected count roughly tripling at contingency vs. mission (B: 4→11, B2: 6→12), while runtime actually drops slightly under the tighter budget in both cases (B: 20.3s→17.5s, B2: 19.8s→16.6s). This replicates the pattern seen in the earlier single-facility test — not a fluke of that one run.
+    Finding: harsher budget consistently means more uncollected supplies, but not slower runtime. Both facilities show uncollected count roughly tripling at contingency vs. mission (B: 4 -> 11, B2: 6 -> 12), while runtime actually drops slightly under the tighter budget in both cases (B: 20.3s -> 17.5s, B2: 19.8s -> 16.6s). This replicates the pattern seen in the earlier single-facility test — not a fluke of that one run.
 
     Why runtime falls despite more leftover work: A tighter budget caps the plan smaller overall (fewer committed trips), which is cheaper for TopUp/SwapSearch to scan even though more supplies end up outside it. This is consistent with [M3-3]'s prediction that TopUp's cost tracks committed-plan size — just pulling in the opposite direction from "harsher budget" here, since committed size shrinks faster than uncollected count grows.
 
-    Significance: "Harsher budget → more leftover work" holds reliably across both facilities and algorithms; "harsher budget → slower" does not — if anything the reverse holds here. That's a genuinely useful operational finding: a tighter budget scenario shouldn't be assumed to be the more expensive one to compute, since a smaller committed plan can more than offset the cost of a larger candidate pool.
+    Significance: "Harsher budget -> more leftover work" holds reliably across both facilities and algorithms; "harsher budget -> slower" does not — if anything the reverse holds here. So, a tighter budget scenario shouldn't be assumed to be the more expensive one to compute, since a smaller committed plan can more than offset the cost of a larger candidate pool.
     """)
     return
 
@@ -3931,7 +4244,7 @@ def _(
             for _name, _stages in _stage_configs:
                 _plan, _ = ext_hybrid_solve(inst=_scenario_inst, actor=actor, critic=critic, seed=aco_rng_seed, use_or_opt=_stages[0], use_topup=_stages[1],
                     use_final_topup=_stages[2], use_swap_search=_stages[3])
-            
+
                 _row[_name] = ext_aco_plan_value(_plan, _scenario_inst)
             _rows.append(_row)
         return {"rows": _rows, "stage_names": [n for n, _ in _stage_configs]}
@@ -4002,6 +4315,8 @@ def _(mo):
     ## Extension D -- 15K VS 40K Training Instance Checkpoint Comparison
 
     The 50-seed comparison between the 15k-instance and 40k-instance policy checkpoints was run outside this notebook using a standalone script that duplicates the canonical pipeline exactly. Therefore, for each seed, the only difference between the two runs is which `.pt` policy file is loaded. The resulting values are compared directly below on a per-seed basis. The two policies produce identical values for 42 of the 50 seeds, while the 40k policy is higher on 5 seeds and lower on 3. This shows that the additional 25k training instances do not produce a consistent improvement in the value reached by the ACO/RL pipeline. Instead, both policies are able to reach essentially the same solutions across the tested facility seeds, supporting the Extension C finding that the robustness of ACO/RL alone is sufficient to reach the facility's peak value without requiring `SwapSearch` or `TopUp`.
+
+    *The 40k based checkpoint files are included in appendices folder.*
     """)
     return
 
@@ -4010,6 +4325,7 @@ def _(mo):
 def _(mo):
     # Raw per-seed value delivered:
     # (data point, value by 15k policy, value by 40k policy)
+    # Data collated from external run
 
     _ext_d_data = [
         (1, 88, 88), (2, 80, 80), (3, 84, 84), (4, 65, 65), (5, 79, 79),
@@ -4090,7 +4406,7 @@ def _(mo):
     """
 
     mo.md(f"""
-    ## 15k vs 40k Policy Comparison
+    ### Per-seed results
 
     <div style="
         display:grid;
@@ -4117,24 +4433,10 @@ def _(mo):
     **Comparison:** {_equal} / 50 data points are identical, 
     **{_improved}** are higher under the 40k policy, and **{_worse}** are lower.
 
-    The comparison shows that increasing policy training from 15k to 40k
-    instances has very little practical effect on the value reached by ACO/RL
-    on this facility. The two policies produce exactly the same value on
-    {_equal} of the 50 tested facility seeds. Where they do differ, the
-    differences are small and occur in both directions: the 40k policy is
-    higher on {_improved} seeds but lower on {_worse} seeds. This indicates
-    that the additional 25k training instances do not produce a consistent
-    improvement in the final solution quality.
+    The comparison shows that increasing policy training from 15k to 40k instances has very little practical effect on the value reached by ACO/RL on this facility. The two policies produce exactly the same value on {_equal} of the 50 tested facility seeds. Where they do differ, the differences are small and occur in both directions: the 40k policy is higher on {_improved} seeds but lower on {_worse} seeds. This indicates that the additional 25k training instances do not produce a consistent improvement in the final solution quality.
 
-    This also supports the finding from **Extension C** that ACO/RL alone is
-    robust enough to reach the peak value point of the facility without
-    requiring `SwapSearch` or `TopUp`. Since both the 15k and 40k policies
-    independently reach essentially the same final values across the same
-    facility seeds, the results suggest that the ACO/RL search process itself
-    is sufficiently robust to reach the facility's high-value solution
-    regardless of which of these two policies is used to guide it. Therefore,
-    the additional training represented by the 40k-instance policy does not
-    appear necessary for achieving the observed peak value on this facility.
+    This also supports the finding from **Extension C** that ACO/RL alone is robust enough to reach the peak value point of the facility without requiring `SwapSearch` or `TopUp`. Since both the 15k and 40k policies independently reach essentially the same final values across the same facility seeds, the results suggest that the 15k ACO/RL search process itself is sufficiently robust to reach the facility's high-value solution regardless of which of these two policies is used to guide it. Therefore,
+    the additional training represented by the 40k-instance policy does not appear necessary for achieving the observed peak value on this facility.
     """)
     return
 
@@ -4222,7 +4524,7 @@ def _(ext_e_result, mo, plt):
 
     Finding: value is completely flat; runtime is not. Priority value stays pinned at 91 across the entire range, from 8 ants up to 64. Runtime, meanwhile, climbs steadily and non-linearly — roughly 17s at 8 ants, up to ~37.5s at 64 ants, with the steepest jump between 48 and 64.
 
-    Significance: 8 ants per iteration already reaches the same value as 64 — a full 8x increase in ant count buys zero additional quality on this facility/budget, only more than double the runtime. Combined with the stage-ablation result (C/C2), this reinforces the same picture from a different angle: the ACO's search breadth saturates this instance's achievable ceiling very quickly, well before either more ants or more local-search stages have anything left to contribute. Practically, this argues for a much lower ant count as the efficient operating point here — 64 ants is pure overhead on this facility, not insurance. As with the stage ablation, it's worth checking whether this saturation point shifts on a facility or budget regime with more genuine search difficulty, where ant count might actually matter.
+    Significance: 8 ants per iteration already reaches the same value as 64 — a full 8x increase in ant count buys zero additional quality on this facility/budget, only more than double the runtime. Combined with the stage-ablation result (C/C2), this reinforces the same picture from a different angle: the ACO's search breadth saturates this instance's achievable ceiling very quickly, well before either more ants or more local-search stages have anything left to contribute. Practically, this argues for a much lower ant count as the efficient operating point here — 64 ants is pure overhead on this facility, not insurance. - More dicussed in H.
     """)
     ])
     return
@@ -4389,7 +4691,7 @@ def _(ext_f_gif_path, mo):
         mo.image(src=ext_f_gif_path,
                   alt="Pheromone field evolution across all ACO iterations"),
         mo.md("""
-    The title above the animation tracks the iteration number and the best plan value found so far, so quality improvement over time can be seen. The pheromone gets reset 3 times, once at iteration 21, and once at 45. This allows best plan so far to continue between ACO restarts while allowing new random exploration to aid in escaping local best-cases. As can be seen, in this specific instance, the best value found was discovered in the first iteration, and so the remainder of the run time acted as purely safety checks to make sure nothing better can be found.
+    The title above the animation tracks the iteration number and the best plan value found so far, so quality improvement over time can be seen. The pheromone field resets twice more during the run -- at iteration 21 and again at 45 -- marking the start of each of the three ACO restarts. This allows best plan so far to continue between ACO restarts while allowing new random exploration to aid in escaping local best-cases. As can be seen, in this specific instance, the best value found (91) was already locked in by the second iteration, and so the vast majority of the remaining run time acted as purely safety checks to make sure nothing better could be found.
     """)
     ])
     return
@@ -4449,7 +4751,7 @@ def _(mo, np, plt, viz_run):
     The step line is the best plan value found *so far* at every recorded moment in time -- it can only ever go up or stay flat, never down, since `global_best` is only ever replaced by something strictly better. The shaded area under the line is just a visual aid to make the "already-locked-in" value at any point in time easier to read at a
     glance; the dashed horizontal line marks the run's actual final value for reference. Generated fresh from the same run as the Extension F animation above, so always accurate.
 
-    This run reached its final value of **{viz_run['final_value']}** at **{_t_reach_final:.1f}s**, out of **{viz_run['elapsed']:.1f}s** total wall-clock time -- meaning roughly {100 * _t_reach_final / viz_run['elapsed']:.0f}% of the run's total time was spent finding the answer, and the remaining {100 * (1 - _t_reach_final / viz_run['elapsed']):.0f}% was spent on the later ACO restarts, top-up, and swap-search *confirming* nothing better exists, rather than on genuine search difficulty. That's a useful number in its own right: it says that if this run were deadline-bound and cut off at `{_t_reach_final:.0f}` seconds instead of running to completion, the delivered value would have been identical.
+    This run reached its final value of **{viz_run['final_value']}** at **{_t_reach_final:.1f}s**, out of **{viz_run['elapsed']:.1f}s** total wall-clock time -- meaning roughly {100 * _t_reach_final / viz_run['elapsed']:.0f}% of the run's total time was spent finding the answer, and the remaining {100 * (1 - _t_reach_final / viz_run['elapsed']):.0f}% was spent on the later ACO restarts, top-up, and swap-search *confirming* nothing better exists, rather than on genuine search difficulty. That's a useful number in its own right: it says that if this run were deadline-bound and cut off at `{_t_reach_final:.0f}` second instead of being able to run to completion, the delivered value would have been identical.
     """)
     ])
     return
@@ -4621,26 +4923,17 @@ def _(ext_h_result, mo, np, plt):
 
     ### Experimental conditions
 
-    **Part A** — `use_or_opt=False`, `use_topup=False`
-    Baseline ACO configuration with no per-ant Or-opt or top-up.
+    **Part A** — `use_or_opt=False`, `use_topup=False` Baseline ACO configuration with no per-ant Or-opt or top-up.
 
-    **Part B** — `use_or_opt=True`, `use_topup=False`
-    Adds Or-opt to each ant's plan before it enters the pool, while leaving
-    top-up disabled.
+    **Part B** — `use_or_opt=True`, `use_topup=False` Adds Or-opt to each ant's plan before it enters the pool, while leaving top-up disabled.
 
-    **Part C** — `use_or_opt=True`, `use_topup=True`
-    Adds both Or-opt and top-up (`max_insert_size=2`) to each ant's plan
-    before it enters the pool.
+    **Part C** — `use_or_opt=True`, `use_topup=True` Adds both Or-opt and top-up (`max_insert_size=2`) to each ant's plan before it enters the pool.
 
     ### Interpretation
 
-    The **B − A** delta isolates the contribution of Or-opt relative to the
-    baseline.
-    The **C − A** delta shows the combined contribution of Or-opt and
-    per-ant top-up relative to the baseline.
-    These measurements concern the **ACO layer only**. They are independent
-    of the final top-up and swap-search stages performed by `hybrid_solve`,
-    which remain unchanged across the comparison.
+    The **B − A** delta isolates the contribution of Or-opt relative to the baseline. The **C − A** delta shows the combined contribution of Or-opt and per-ant top-up relative to the baseline. These measurements concern the **ACO layer only**. They are independent of the final top-up and swap-search stages performed by `hybrid_solve`, which remain unchanged across the comparison.
+
+    As can be seen in the charts, using only 8 ants in the first ACO run generally produces lower-valued solutions than using 32 or 48 ants when Or-opt and top-up are disabled. While the maximum observed value is achievable with 48 ants, the additional ant population increases the computational overhead and therefore runtime. With Or-opt enabled, 32 ants is able to reach the same maximum observed value as 48 ants, while the smaller 8-ant population still produces lower-valued solutions. When top-up is also enabled, all tested ant populations reach the same maximum observed value. However, top-up is an expensive operation to run, with a complexity of O(k^6), so applying it across larger ant populations increases computational cost. Therefore, 32 ants provides a practical balance between solution quality and computation time, achieving the maximum observed value with Or-opt while avoiding the additional overhead of a 48 ant population.
     """
             ),
         ]
@@ -4653,25 +4946,9 @@ def _(mo):
     mo.md(r"""
     ## Extension I -- What Did the Trained Policy Actually Learn?
 
-    Everything so far has judged the pipeline by its *outputs* (final plan
-    value, runtime, gaps against the exact solver). This section instead
-    looks directly at the actor network's own internal preferences, with
-    every other part of the pipeline switched off -- no pheromone bias
-    accumulated yet, no ACO restarts, no top-up or swap-search polishing
-    anything afterward. Concretely: standing at the shaft, with an empty
-    trip, zero budget spent, and every pheromone entry at its neutral
-    starting value of 1.0, the standalone `rl_firstmove.py` script builds
-    the same seven-feature vector `BuildFeatures` would build for every one
-    of the facility's 30 supply nodes, feeds all 30 through the trained
-    actor in one batch, and reads off the resulting softmax probability for
-    each -- i.e. exactly what the policy would pick as its very first move,
-    with nothing else influencing the decision.
+    Everything so far has judged the pipeline by its *outputs* (final plan value, runtime, gaps against the exact solver). This section instead looks directly at the actor network's own internal preferences, with every other part of the pipeline switched off -- no pheromone bias accumulated yet, no ACO restarts, no top-up or swap-search polishing anything afterward. Concretely: standing at the shaft, with an empty trip, zero budget spent, and every pheromone entry at its neutral starting value of 1.0, the standalone `rl_firstmove.py` script builds the same seven-feature vector `BuildFeatures` would build for every one of the facility's 30 supply nodes, feeds all 30 through the trained actor in one batch, and reads off the resulting softmax probability for each -- i.e. exactly what the policy would pick as its very first move, with nothing else influencing the decision.
 
-    This matters because it is the cleanest possible test of what the
-    network actually learned to value, as opposed to what the full pipeline
-    ends up delivering (which is also shaped by ACO's search and local
-    search's polishing, and so can't cleanly separate "the policy's own
-    judgement" from "everything else in the pipeline compensating for it").
+    This matters because it is the cleanest possible test of what the network actually learned to value, as opposed to what the full pipeline ends up delivering (which is also shaped by ACO's search and local search's polishing, and so can't cleanly separate "the policy's own judgement" from "everything else in the pipeline compensating for it").
     """)
     return
 
@@ -4730,29 +5007,12 @@ def _(mo, np, plt):
     |---|---|---|---|
     {_tbl}
 
-    Each point on the scatter is one of the facility's 30 supply nodes.
-    The x-axis is that node's value-per-mass density (the same metric
-    Exemplar C's nearest-fill-by-density rule uses); the y-axis is the
-    probability the trained actor's own softmax assigns to picking that
-    node first, on a log scale since the probabilities span several orders
-    of magnitude. Bubble size repeats the y-axis visually (bigger bubble =
-    higher P(pick)); bubble colour repeats the x-axis (value/mass) so both
-    dimensions are readable even without carefully reading the axes. The
-    table above the chart lists the five nodes the policy actually favours
-    most, by raw probability.
+    Each point on the scatter is one of the facility's 30 supply nodes. The x-axis is that node's value-per-mass density (the same metric Exemplar C's nearest-fill-by-density rule uses); the y-axis is the probability the trained actor's own softmax assigns to picking that node first, on a log scale since the probabilities span several orders
+    of magnitude. Bubble size repeats the y-axis visually (bigger bubble = higher P(pick)); bubble colour repeats the x-axis (value/mass) so both dimensions are readable even without carefully reading the axes. The table above the chart lists the five nodes the policy actually favours most, by raw probability.
 
-    The two largest bubbles land on two of the highest value-density nodes
-    in the whole facility -- node `(1,0,0)` (value 5, mass 1) and node
-    `(0,5,2)` (also value 5, mass 1) -- not simply the nodes nearest to the
-    shaft (distance doesn't even appear as an axis here, since at this
-    "empty trip from the shaft" moment the feature vector's distance term
-    is the same relative signal for every candidate, and the policy is
-    clearly not using it as the dominant factor). That's genuine, direct
-    evidence the actor is reasoning about value-per-mass density as its
-    primary signal, not falling back on distance-greedy proximity -- which
-    is exactly the failure mode Exemplar A (nearest-fill) has, and exactly
-    the kind of joint, multi-factor reasoning [M3-1] argued a fixed
-    threshold rule couldn't represent.
+    The two largest bubbles land on two of the highest value-density nodes in the whole facility -- node `(1,0,0)` (value 5, mass 1) and node `(0,5,2)` (also value 5, mass 1) -- not simply the nodes nearest to the shaft (distance doesn't even appear as an axis here, since at this "empty trip from the shaft" moment the feature vector's distance term
+    is the same relative signal for every candidate, and the policy is clearly not using it as the dominant factor). That's genuine, direct evidence the actor is reasoning about value-per-mass density as its primary signal, not falling back on distance-greedy proximity -- which is exactly the failure mode Exemplar A (nearest-fill) has, and exactly
+    the kind of joint, multi-factor reasoning [M3-1] argued a fixed threshold rule couldn't represent.
     """)
     ])
     return
@@ -4817,21 +5077,7 @@ def _(ks, mo, np, plt, times):
     | scipy.optimize.curve_fit (nonlinear, original space) | {ext_j_result['a_fit']:.2f} | {ext_j_result['b_fit']:.4f} | {ext_j_result['r_squared']:.4f} |
     | np.polyfit (linear, log-log space) | {ext_j_result['a_loglinear']:.2f} | {ext_j_result['b_loglinear']:.4f} | -- |
 
-    Both methods agree closely (b ≈ 1.10-1.17), and the nonlinear fit
-    explains 98.1% of the variance in the measured times. An exponent
-    just above 1 means `my_algorithm`'s runtime grows close to
-    *linearly* with the number of supply units k, not exponentially --
-    consistent with its structure: `or_opt_plan`, `top_up_plan`, and
-    `swap_search` all operate over fixed, bounded neighbourhoods
-    (segment length ≤3, insertion combos ≤3, a capped candidate pool of
-    14) that don't grow with k, so the only genuinely k-dependent cost
-    is the roughly linear number of candidates each ACO step and each
-    bounded local-search pass has to consider. This is a meaningfully
-    different growth profile from the *exact* solver used as a ground
-    truth in Extension K, which is provably exponential in the worst
-    case (O(2^k) over the subset space) -- the two shouldn't be
-    conflated, since they're different algorithms answering different
-    questions.
+    Both methods agree closely (b = 1.10-1.17), and the nonlinear fit explains 98.1% of the variance in the measured times. An exponent just above 1 means `my_algorithm`'s runtime grows close to *linearly* with the number of supply units k, not exponentially -- consistent with its structure: `or_opt_plan`, `top_up_plan`, and `swap_search` all operate over fixed, bounded neighbourhoods (segment length <= 3, insertion combos <= 3, a capped candidate pool of 14) that don't grow with k, so the only genuinely k-dependent cost is the roughly linear number of candidates each ACO step and each bounded local-search pass has to consider. This is a meaningfully different growth profile from the *exact* solver used as a ground truth in Extension K, which is provably exponential in the worst case (O(2^k) over the subset space) -- the two shouldn't be conflated, since they're different algorithms answering different questions.
     """),
     ])
     return
@@ -4842,106 +5088,211 @@ def _(mo):
     mo.md(r"""
     ## Extension K -- Multi-Seed Generalisation of the Trained Policy
 
-    Every other extension in this section uses this facility's own single
-    seed. That leaves one obvious, important question unanswered: did the
-    policy learn something genuinely transferable about this *class* of
-    facility, or did it simply memorise good responses to the one specific
-    layout it happens to have been evaluated on throughout this notebook?
-    This section is the direct test of that.
+    Every other extension in this section uses this facility's own single seed. That leaves one obvious, important question unanswered: did the policy learn something genuinely transferable about this *class* of facility, or did it simply memorise good responses to the one specific layout it happens to have been evaluated on throughout this notebook? This section is the direct test of that.
 
-    The saved checkpoint on disk is `policy_wings2.pt` only (the other two
-    wing-count checkpoints aren't bundled here), so this sweep is
-    restricted to 10 freshly drawn seeds that land in the same `n_wings=2`
-    bucket the policy was actually trained on: this facility's own seed,
-    plus 9 entirely different facilities the policy has never seen or been
-    evaluated against before. For each of the 10, the standalone
-    `sweep_multiseed.py` script (run outside this notebook) computes two
-    things: the full k=30 hybrid solve's value, cost, and runtime; and,
-    separately, a smaller k=15 sub-problem (the top 15 supplies by
-    value/mass density, with the budget scaled down proportionally to
-    15/30) checked directly against the exact DP solver, which is only
-    tractable at this reduced size. That second, smaller check is what
-    makes this a genuine optimality-gap reading rather than just "the
-    policy produced *some* plan on unseen data" -- it tells you exactly how
-    far from provably-optimal the policy's decisions actually are on
-    facilities it has never encountered.
+    This sweep is restricted to 10 freshly drawn seeds for every fac size (2/3/4 wings) bucket the policy was actually trained on. For each of the 10, the standalone `sweep_multiseed.py` script (run outside this notebook) computes two things: the full k=30 hybrid solve's value, cost, and runtime; and, separately, a smaller k=15 sub-problem (the top 15 supplies by value/mass density, with the budget scaled down proportionally to 15/30) checked directly against the exact DP solver, which is only
+    tractable at this reduced size. That second, smaller check is what makes this a genuine optimality-gap reading rather than just "the policy produced *some* plan on unseen data" -- it tells exactly how far from provably-optimal the policy's decisions actually are on facilities it has never encountered.
     """)
     return
 
 
 @app.cell
 def _(mo, np, plt):
-    # From sweep_multiseed.py, run outside this notebook: seed, full-problem
-    # value/cost/time, and a k=15 exact-vs-hybrid optimality check.
-    _rows = [
-        (23092008, 91, 4837.0, 9.8077, 53, 53, 0.0),
-        (904890414, 76, 4698.0, 9.0563, 50, 50, 0.0),
-        (777952761, 85, 4584.0, 9.2943, 54, 54, 0.0),
-        (790515015, 78, 4361.0, 9.7291, 50, 50, 0.0),
-        (101845485, 80, 4565.0, 9.0535, 56, 56, 0.0),
-        (767136564, 73, 4968.0, 8.5387, 47, 47, 0.0),
-        (123766749, 82, 5610.0, 9.4524, 56, 56, 0.0),
-        (560251884, 86, 3573.0, 8.9268, 57, 57, 0.0),
-        (260631270, 76, 4083.0, 8.9235, 49, 49, 0.0),
-        (995943669, 84, 5265.0, 9.2146, 57, 57, 0.0),
+    # From sweep_multiseed.py, run outside this notebook:
+    # seed, full-problem value/cost/time, and k=15 exact-vs-hybrid
+    # optimality check for the n_wings=2, 3, and 4 policies.
+
+    _rows_wings2 = [
+        (23092008, 91, 4833.0, 13.4419, 50, 50, 0.0),
+        (330754347, 86, 3672.0, 18.5259, 49, 49, 0.0),
+        (224306871, 67, 5085.0, 17.6388, 46, 46, 0.0),
+        (316298898, 77, 4999.0, 15.4829, 48, 48, 0.0),
+        (747868290, 83, 4861.0, 13.0964, 46, 46, 0.0),
+        (900101838, 83, 4387.0, 13.5257, 47, 47, 0.0),
+        (816728232, 68, 4401.0, 13.1244, 44, 42, 4.5),
+        (298280592, 92, 3961.0, 14.1642, 50, 50, 0.0),
+        (382451373, 78, 4887.0, 18.5473, 43, 43, 0.0),
+        (622713612, 86, 4095.0, 13.2425, 52, 52, 0.0),
     ]
-    _seeds = [str(r[0]) for r in _rows]
-    _vals = [r[1] for r in _rows]
-    _gaps = [r[6] for r in _rows]
 
-    _fig, _axes = plt.subplots(1, 2, figsize=(11, 3.8))
-    _colors = ['#F59E0B' if s == '23092008' else '#0B6E6B' for s in _seeds]
-    _axes[0].bar(_seeds, _vals, color=_colors)
-    _axes[0].set_ylabel("full-problem priority value")
-    _axes[0].set_title("Value delivered, 10 unseen n_wings=2 facilities", fontsize=10)
-    _axes[0].tick_params(axis='x', rotation=60)
-    _axes[0].grid(alpha=0.3, axis='y')
+    _rows_wings3 = [
+        (779946154, 78, 3666.0, 19.3160, 48, 48, 0.0),
+        (294112564, 77, 9685.0, 18.9622, 42, 42, 0.0),
+        (787041370, 91, 5062.0, 13.1398, 49, 49, 0.0),
+        (893815447, 80, 4920.0, 12.3955, 49, 49, 0.0),
+        (26643082, 77, 9632.0, 10.4843, 51, 51, 0.0),
+        (206634832, 76, 5250.0, 11.7826, 46, 46, 0.0),
+        (347208553, 70, 4942.0, 10.4760, 46, 46, 0.0),
+        (446348869, 79, 4774.0, 10.8595, 45, 45, 0.0),
+        (51429685, 91, 5685.0, 11.0301, 53, 53, 0.0),
+        (560742958, 88, 7155.0, 10.7015, 52, 52, 0.0),
+    ]
 
-    _axes[1].bar(_seeds, _gaps, color='#7A1E2C')
-    _axes[1].set_ylabel("k=15 optimality gap (%)")
-    _axes[1].set_title("Hybrid vs. exact DP, k=15 sub-problem", fontsize=10)
-    _axes[1].set_ylim(-1, 5)
-    _axes[1].tick_params(axis='x', rotation=60)
-    _axes[1].grid(alpha=0.3, axis='y')
+    _rows_wings4 = [
+        (470516294, 81, 7562.0, 12.3766, 49, 49, 0.0),
+        (719311616, 87, 7910.0, 12.8351, 54, 54, 0.0),
+        (734562590, 80, 11420.0, 12.5247, 48, 48, 0.0),
+        (859933205, 83, 10127.0, 11.6939, 44, 44, 0.0),
+        (554222819, 81, 13921.0, 11.2333, 46, 46, 0.0),
+        (287876738, 85, 7244.0, 12.1322, 47, 47, 0.0),
+        (982650806, 80, 10172.0, 12.1314, 48, 48, 0.0),
+        (269243285, 79, 5249.0, 13.8116, 41, 41, 0.0),
+        (664407374, 69, 6930.0, 11.2469, 42, 42, 0.0),
+        (267722117, 87, 8389.0, 11.8909, 53, 53, 0.0),
+    ]
+
+    def _make_policy_panel(_ax_value, _ax_gap, _rows, _n_wings, _highlight_seed):
+        _seeds = [str(r[0]) for r in _rows]
+        _vals = [r[1] for r in _rows]
+        _gaps = [r[6] for r in _rows]
+
+        _colors = [
+            '#F59E0B' if str(r[0]) == _highlight_seed else '#0B6E6B'
+            for r in _rows
+        ]
+
+        _ax_value.bar(_seeds, _vals, color=_colors)
+        _ax_value.set_ylabel("full-problem priority value")
+        _ax_value.set_title(
+            f"n_wings={_n_wings}: value delivered",
+            fontsize=10
+        )
+        _ax_value.tick_params(axis='x', rotation=60)
+        _ax_value.grid(alpha=0.3, axis='y')
+
+        _ax_gap.bar(_seeds, _gaps, color='#7A1E2C')
+        _ax_gap.set_ylabel("k=15 optimality gap (%)")
+        _ax_gap.set_title(
+            f"n_wings={_n_wings}: hybrid vs. exact k=15",
+            fontsize=10
+        )
+        _ax_gap.set_ylim(-1, 5)
+        _ax_gap.tick_params(axis='x', rotation=60)
+        _ax_gap.grid(alpha=0.3, axis='y')
+
+    _fig, _axes = plt.subplots(
+        3, 2,
+        figsize=(13, 11)
+    )
+
+    _make_policy_panel(
+        _axes[0, 0],
+        _axes[0, 1],
+        _rows_wings2,
+        2,
+        "23092008"
+    )
+
+    _make_policy_panel(
+        _axes[1, 0],
+        _axes[1, 1],
+        _rows_wings3,
+        3,
+        None
+    )
+
+    _make_policy_panel(
+        _axes[2, 0],
+        _axes[2, 1],
+        _rows_wings4,
+        4,
+        None
+    )
+
     plt.tight_layout()
 
-    _mean_val = np.mean(_vals)
-    _tbl = "\n".join(
-        f"| {r[0]}{' (this facility)' if r[0] == 23092008 else ''} | {r[1]} | "
-        f"{r[2]:.0f} | {r[3]:.1f}s | {r[4]} | {r[5]} | {r[6]:.1f}% |"
-        for r in _rows
+    _all_rows = (
+        _rows_wings2 +
+        _rows_wings3 +
+        _rows_wings4
     )
+
+    _mean_val_w2 = np.mean([r[1] for r in _rows_wings2])
+    _mean_val_w3 = np.mean([r[1] for r in _rows_wings3])
+    _mean_val_w4 = np.mean([r[1] for r in _rows_wings4])
+
+    _mean_val_all = np.mean([r[1] for r in _all_rows])
+
+    _gaps_all = [r[6] for r in _all_rows]
+    _zero_gap_count = sum(g == 0.0 for g in _gaps_all)
+    _total_gap_count = len(_gaps_all)
+
+    _max_gap = max(_gaps_all)
+
+    def _make_table(_rows):
+        return "\n".join(
+            f"| {r[0]}"
+            f"{' (this facility)' if r[0] == 23092008 else ''} | "
+            f"{r[1]} | {r[2]:.0f} | {r[3]:.1f}s | "
+            f"{r[4]} | {r[5]} | {r[6]:.1f}% |"
+            for r in _rows
+        )
+
+    _tbl_w2 = _make_table(_rows_wings2)
+    _tbl_w3 = _make_table(_rows_wings3)
+    _tbl_w4 = _make_table(_rows_wings4)
+
     mo.vstack([
         _fig,
+
         mo.md(f"""
+    ### n_wings=2
+
     | seed | full value | full cost | time | k=15 exact | k=15 hybrid | gap |
-    |---|---|---|---|---|---|---|
-    {_tbl}
+    |---|---:|---:|---:|---:|---:|---:|
+    {_tbl_w2}
 
-    The left panel is priority value delivered on each of the ten
-    facilities (amber = this facility's own seed, teal = the nine unseen
-    ones); the right panel is the same ten facilities' optimality gap
-    against the exact solver on the k=15 sub-problem, where 0% means the
-    hybrid pipeline matched the provably optimal answer exactly and any
-    positive number means it fell short by that percentage of the exact
-    optimum's value. The table underneath both panels has every raw number
-    behind the bars: full-problem value and cost, solve time, and the exact
-    k=15/hybrid k=15 comparison pair the gap column is computed from.
+    **Mean full-problem value:** {_mean_val_w2:.1f}  
+    **Value range:** {min(r[1] for r in _rows_wings2)}–{max(r[1] for r in _rows_wings2)}
 
-    0.0% optimality gap on all 10 unseen facilities on the k=15 check, mean
-    full-problem value {_mean_val:.1f} (range {min(_vals)}-{max(_vals)}
-    across genuinely different mazes and value distributions, since each
-    seed produces an entirely different maze layout via `get_facility`, not
-    just a relabelling of the same one). This is real, direct evidence the
-    actor learned transferable value-density reasoning that generalises
-    across facilities, rather than overfitting to the one specific layout
-    used everywhere else in this notebook -- though it's worth stating the
-    claim's honest limits precisely: only the `n_wings=2` checkpoint was
-    available to test here, so this says nothing about whether the
-    `wings3`/`wings4` policies generalise the same way, and the k=15
-    optimality check is on a smaller sub-problem than the full k=30
-    facility, since the exact solver isn't tractable at the full size (see
-    [M3-4]).
+
+    """),
+
+        mo.md(f"""
+    ### n_wings=3
+
+    | seed | full value | full cost | time | k=15 exact | k=15 hybrid | gap |
+    |---|---:|---:|---:|---:|---:|---:|
+    {_tbl_w3}
+
+    **Mean full-problem value:** {_mean_val_w3:.1f}  
+    **Value range:** {min(r[1] for r in _rows_wings3)}–{max(r[1] for r in _rows_wings3)}
+
+
+    """),
+
+        mo.md(f"""
+    ### n_wings=4
+
+    | seed | full value | full cost | time | k=15 exact | k=15 hybrid | gap |
+    |---|---:|---:|---:|---:|---:|---:|
+    {_tbl_w4}
+
+    **Mean full-problem value:** {_mean_val_w4:.1f}  
+    **Value range:** {min(r[1] for r in _rows_wings4)}–{max(r[1] for r in _rows_wings4)}
+
+
+    """),
+
+        mo.md(f"""
+    ### Cross-policy summary
+
+    Across the **30 independently generated facilities**:
+
+    - **Mean full-problem value:** {_mean_val_all:.1f}
+    - **n_wings=2 mean:** {_mean_val_w2:.1f}
+    - **n_wings=3 mean:** {_mean_val_w3:.1f}
+    - **n_wings=4 mean:** {_mean_val_w4:.1f}
+    - **k=15 exact matches:** {_zero_gap_count}/{_total_gap_count}
+    - **Maximum observed k=15 gap:** {_max_gap:.1f}%
+
+    The three panels separate the results by policy checkpoint: `n_wings=2`, `n_wings=3`, and `n_wings=4`. Each row represents a different random facility generated from its seed, rather than a relabelling of the same maze.
+
+    For `n_wings=2`, seed `23092008` is highlighted in amber because it is the facility used elsewhere in the notebook; the other nine facilities are independently generated test cases. The `n_wings=3` and `n_wings=4` datasets contain ten independently generated facilities each.
+
+    The k=15 column compares the hybrid pipeline against the exact solver on the smaller k=15 sub-problem. A gap of `0.0%` means the hybrid returned the same value as the exact solution. The one non-zero result in the n_wings=2 dataset is seed `816728232`, where the exact solution collected value `44` and the hybrid collected `42`, corresponding to the recorded `4.5%` gap.
+
+    The full-problem results are separate from this k=15 verification: the exact solver is not being used to establish optimality of the larger full problems. The k=15 experiment therefore provides an optimality check of the hybrid's behaviour on a tractable sub-problem, while the full-problem columns report the hybrid's scalable performance on the complete facilities.
     """)
     ])
     return
@@ -4952,33 +5303,15 @@ def _(mo):
     mo.md(r"""
     ## Extension L -- Route Replay: Watching CRUDY-1 Work
 
-    Every other section in this notebook describes `my_plan` in numbers:
-    total value, total cost, trip count. This section replaces the numbers
-    with the literal thing those numbers describe -- CRUDY-1 physically
-    moving through the facility. It replays the actual submitted `my_plan`
-    one shuttle trip at a time on the real facility map (the same
-    `draw_facility` renderer used throughout the rest of this notebook, so
-    the corridors, wings, and junctions are drawn exactly as they are
-    everywhere else), turning the abstract idea of "a plan" into a literal
-    walkthrough of what CRUDY-1 actually does on each trip: descend from
-    the shaft, collect supply units up to the `CAP` mass limit, return to
-    the shaft, deposit, and descend again for the next trip, until the plan
-    is exhausted and the final exit is taken.
+    Every other section in this notebook describes `my_plan` in numbers: total value, total cost, trip count. This section replaces the numbers with the literal thing those numbers describe -- CRUDY-1 physically moving through the facility. It replays the actual submitted `my_plan` one shuttle trip at a time on the real facility map (the same `draw_facility` renderer used throughout the rest of this notebook, so the corridors, wings, and junctions are drawn exactly as they are everywhere else), turning the abstract idea of "a plan" into a literal walkthrough of what CRUDY-1 actually does on each trip: descend from the shaft, collect supply units up to the `CAP` mass limit, return to the shaft, deposit, and descend again for the next trip, until the plan is exhausted and the final exit is taken.
 
-    Two generation cells sit below this one: the first renders one complete
-    facility-map frame per trip (so trip 5's frame shows trips 1 through 5
-    all drawn in, cumulatively); the second turns that sequence of frames
-    into an animated GIF and caches it. Rendering a full facility map per
-    trip is the slowest generation step in this whole extension section --
-    it only needs to run once, though, since the result is cached exactly
-    like every other GIF here.
+    Two generation cells sit below this one: the first renders one complete facility-map frame per trip (so trip 5's frame shows trips 1 through 5 all drawn in, cumulatively); the second turns that sequence of frames into an animated GIF and caches it. Rendering a full facility map per trip is the slowest generation step in this whole extension section -- it only needs to run once, though, since the result is cached exactly like every other GIF here.
     """)
     return
 
 
 @app.cell
 def _(draw_facility, my_plan, np, plan_cost, plan_value, plt):
-    # Generation cell 1/2: one full facility-map frame per shuttle trip.
     route_frames = []
     for _i in range(1, len(my_plan) + 1):
         _partial = my_plan[:_i]
@@ -5006,10 +5339,6 @@ def _(
     plt,
     route_frames,
 ):
-    # Generation cell 2/2: turns the frames above into a GIF and caches it.
-    # Tweak playback speed via the fps passed to PillowWriter below, then
-    # delete MEMO_3/extras_assets/route_replay.gif (+ .json sidecar) to
-    # force a re-render.
     _h, _w = route_frames[0].shape[0], route_frames[0].shape[1]
 
     def _render_ext_l_gif(_save_path):
@@ -5023,9 +5352,6 @@ def _(
             _im.set_data(route_frames[frame_idx])
             return (_im,)
 
-        # +20 frames at the end just replay the final trip's map (via the
-        # clamp above), so the completed route is visible for a moment
-        # before the GIF loops back to the start.
         _ani = animation.FuncAnimation(_fig, _update, frames=len(route_frames) + 20,
                                         interval=700, blit=False)
         _ani.save(_save_path, writer=animation.PillowWriter(fps=1.4))
@@ -5045,17 +5371,7 @@ def _(ext_l_gif_path, mo):
     mo.vstack([
         mo.image(src=ext_l_gif_path, alt="Route replay of the submitted plan"),
         mo.md("""
-    Each frame reveals one more shuttle run, drawn cumulatively on top of
-    the ones before it, so by the final frame every trip in the plan is
-    visible on the map at once. The title above the map updates every frame
-    to show which trip number is being added, the running priority value
-    collected so far, and the running budget spent so far -- watch both
-    numbers climb together, trip by trip, as CRUDY-1 works through the plan
-    and finally makes its last run out through an exit once every trip is
-    complete. Because the frames are cumulative rather than one-trip-at-a-
-    time, this also makes it easy to see visually which parts of the
-    facility the plan spends most of its budget reaching, versus which
-    supply-dense pockets it clears out cheaply in a single trip.
+    Each frame reveals one more shuttle run, drawn cumulatively on top of the ones before it, so by the final frame every trip in the plan is visible on the map at once. The title above the map updates every frame to show which trip number is being added, the running priority value collected so far, and the running budget spent so far -- watch both numbers climb together, trip by trip, as CRUDY-1 works through the plan and finally makes its last run out through an exit once every trip is complete. Because the frames are cumulative rather than one-trip-at-a-time, this also makes it easy to see visually which parts of the facility the plan spends most of its budget reaching, versus which supply-dense pockets it clears out cheaply in a single trip.
     """)
     ])
     return
@@ -5066,18 +5382,7 @@ def _(mo):
     mo.md(r"""
     ## Extension M -- Full Pheromone Matrix (Every Supply Pair)
 
-    Extension F's animation only ever shows one slice of the pheromone
-    table: the shaft's own outgoing edges, i.e. "which unit does the policy
-    prefer to visit *first*". But `initialise_pheromone` actually builds an
-    entry for every ordered pair of supply units too (`pheromone[u, v]` for
-    every `u != v`), which is what lets the policy express a preference for
-    *sequencing* -- "having just visited unit i, which unit should come
-    next" -- not just a first-pick preference. That second kind of
-    preference never gets a moment on screen in Extension F's animation, so
-    this section shows it directly: the complete, final supply-to-supply
-    pheromone matrix from the exact same instrumented run Extensions F and
-    G both use (`viz_run`), read once at the very end rather than animated
-    frame by frame.
+    Extension F's animation only ever shows one slice of the pheromone table: the shaft's own outgoing edges, i.e. "which unit does the policy prefer to visit *first*". But `initialise_pheromone` actually builds an entry for every ordered pair of supply units too (`pheromone[u, v]` for every `u != v`), which is what lets the policy express a preference for *sequencing* -- "having just visited unit i, which unit should come next" -- not just a first-pick preference. That second kind of preference never gets a moment on screen in Extension F's animation, so this section shows it directly: the complete, final supply-to-supply pheromone matrix from the exact same instrumented run Extensions F and G both use (`viz_run`), read once at the very end rather than animated frame by frame.
     """)
     return
 
@@ -5100,29 +5405,197 @@ def _(mo, np, plt, viz_run):
     mo.vstack([
         _fig,
         mo.md("""
-    Every row and column is one of the facility's 30 supply units,
-    labelled S1 through S30 in the same order Extension K's and this
-    notebook's other tables use them; cell `(i, j)` is the final pheromone
-    strength on the directed edge from unit i to unit j after the full
-    `hybrid_solve` run finishes (diagonal cells are forced to zero, since
-    an edge from a unit to itself is meaningless here). Brighter means more
-    reinforced -- that pair of units was part of enough good plans, often
-    enough, that its pheromone survived evaporation and kept accumulating
-    deposits.
+    Every row and column is one of the facility's 30 supply units, labelled S1 through S30 in the same order Extension K's and this notebook's other tables use them; cell `(i, j)` is the final pheromone strength on the directed edge from unit i to unit j after the full `hybrid_solve` run finishes (diagonal cells are forced to zero, since an edge from a unit to itself is meaningless here). Brighter means more reinforced -- that pair of units was part of enough good plans, often enough, that its pheromone survived evaporation and kept accumulating deposits.
 
-    Bright off-diagonal cells are the sequencing pairs the policy converged
-    on -- if the cell for "S(i) then S(j)" shows up bright, the trained
-    actor learned that visiting j right after i within the same trip is a
-    good idea, on top of (and separate from) the shaft-edge, first-move
-    preference already shown in Extension F. Because the matrix isn't
-    symmetric (pheromone is only ever deposited in the direction a trip
-    actually travelled, i to j, not j to i), asymmetry between a cell and
-    its mirror image across the diagonal is itself meaningful: it shows the
-    policy has a genuine directional preference for *order*, not just for
-    which pairs of units tend to end up in the same trip together.
+    Bright off-diagonal cells are the sequencing pairs the policy converged on -- if the cell for "S(i) then S(j)" shows up bright, the trained actor learned that visiting j right after i within the same trip is a good idea, on top of (and separate from) the shaft-edge, first-move preference already shown in Extension F. Because the matrix isn't symmetric (pheromone is only ever deposited in the direction a trip actually travelled, i to j, not j to i), asymmetry between a cell and its mirror image across the diagonal is itself meaningful: it shows the policy has a genuine directional preference for *order*, not just for which pairs of units tend to end up in the same trip together.
     """)
     ])
     return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Extension N -- Large-Scale Hybrid Solver Validation
+
+    Extension K spot-checked policy generalisation on 30 independently generated facilities, split evenly across `n_wings` 2, 3, and 4. That's enough to catch a policy that's simply memorised one layout, but it's a small enough sample that a rare failure mode -- a budget edge case, a facility topology that leaves the solver stuck, or a wing count that scales runtime badly -- could easily sit outside it.
+
+    This section runs the exact same hybrid pipeline the rest of this notebook uses, unmodified, against a much larger and more systematic sweep: thousands of freshly generated facilities per wing count, run end-to-end outside this notebook and logged to `MEMO_3/fac_results.csv`, one row per case -- seed, facility size, budget, returned value/cost, trip count, solve time, and termination status. The goal isn't optimality (that's what Extension K already checked on a tractable subset); it's robustness at scale -- does the pipeline reliably produce a valid, budget-respecting plan, and does it do so in bounded, predictable time, across a facility population it wasn't hand-picked for.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    import pandas as pd
+
+    _EXT_N_FILES = {
+        "Mission (60% battery)": "MEMO_3/fac_results.csv",
+        "Battery contingency (35% battery)": "MEMO_3/fac_results_battery.csv",
+    }
+
+    def _build_ext_n_section(_label, _csv_path):
+        _df = pd.read_csv(_csv_path)
+        _total = len(_df)
+        _ok = _df["status"].astype(str).str.lower().eq("ok")
+        _terminated = _df["solve_time_s"].notna()
+        _no_error = _df["error"].isna() | _df["error"].astype(str).str.strip().eq("")
+        _valid_cost = _df["plan_cost"].notna() & _df["plan_cost"].ge(0)
+        _valid_value = _df["plan_value"].notna() & _df["plan_value"].ge(0)
+        _valid_trips = _df["n_trips"].notna() & _df["n_trips"].ge(0)
+        _success = _ok & _terminated & _no_error & _valid_cost & _valid_value & _valid_trips
+        _success_count = int(_success.sum())
+        _failure_count = _total - _success_count
+        _success_pct = 100.0 * _success_count / _total if _total else 0.0
+        _mean_time = _df["solve_time_s"].mean()
+        _max_time = _df["solve_time_s"].max()
+        _mean_value = _df["plan_value"].mean()
+        _mean_cost = _df["plan_cost"].mean()
+        _status_counts = (_df["status"].fillna("missing").astype(str).value_counts().to_dict())
+
+        _by_wings = (
+            _df.assign(_valid=_success)
+            .groupby("n_wings", dropna=False)
+            .agg(
+                cases=("seed", "size"),
+                successful=("_valid", "sum"),
+                mean_value=("plan_value", "mean"),
+                mean_cost=("plan_cost", "mean"),
+                mean_time_s=("solve_time_s", "mean"),
+                max_time_s=("solve_time_s", "max"),
+            )
+            .reset_index()
+        )
+
+        _by_wings["success_rate_%"] = 100.0 * _by_wings["successful"] / _by_wings["cases"]
+
+        _by_wings = _by_wings[
+            [
+                "n_wings",
+                "cases",
+                "successful",
+                "success_rate_%",
+                "mean_value",
+                "mean_cost",
+                "mean_time_s",
+                "max_time_s",
+            ]
+        ]
+
+        _display = _df.copy()
+
+        if "solve_time_s" in _display:
+            _display["solve_time_s"] = _display["solve_time_s"].round(3)
+
+        for _col in [
+            "plan_cost",
+            "plan_value",
+            "exemplar_cost",
+            "budget",
+        ]:
+            if _col in _display:
+                _display[_col] = _display[_col].round(1)
+
+        _finding = (
+            f"Every single one of the {_total:,} tested cases "
+            f"terminated successfully -- a {_success_pct:.2f}% "
+            f"completion rate across all tested facility sizes, "
+            f"with zero timeouts, zero recorded errors, and zero "
+            f"invalid outputs. Mean solve time is "
+            f"{_mean_time:.3f}s overall, with a maximum of "
+            f"{_max_time:.3f}s."
+            if _failure_count == 0
+            else f"{_success_count:,} of {_total:,} tested cases "
+            f"were successfully validated, giving a "
+            f"{_success_pct:.2f}% completion rate. "
+            f"{_failure_count:,} cases failed validation. "
+            f"Mean solve time across recorded cases is "
+            f"{_mean_time:.3f}s, with a maximum of "
+            f"{_max_time:.3f}s."
+        )
+
+        return {
+            "label": _label,
+            "path": _csv_path,
+            "df": _df,
+            "total": _total,
+            "success_count": _success_count,
+            "failure_count": _failure_count,
+            "success_pct": _success_pct,
+            "mean_time": _mean_time,
+            "max_time": _max_time,
+            "mean_value": _mean_value,
+            "mean_cost": _mean_cost,
+            "status_counts": _status_counts,
+            "by_wings": _by_wings,
+            "display": _display,
+            "finding": _finding,
+        }
+
+    _EXT_N_RESULTS = {
+        _label: _build_ext_n_section(_label, _path)
+        for _label, _path in _EXT_N_FILES.items()
+    }
+
+    _ext_n_blocks = []
+
+    for _label, _r in _EXT_N_RESULTS.items():
+
+        _ext_n_blocks.extend(
+            [
+                mo.md(f"""
+    ## {_label}
+
+    **Source:** `{_r["path"]}`
+    """),
+                mo.md(f"""
+    ### Validation summary
+
+    | Metric | Result |
+    |---|---:|
+    | Total tested cases | **{_r["total"]:,}** |
+    | Successful valid solutions | **{_r["success_count"]:,}** |
+    | Unsuccessful / invalid cases | **{_r["failure_count"]:,}** |
+    | Successful termination rate | **{_r["success_pct"]:.2f}%** |
+    | Mean solve time | **{_r["mean_time"]:.3f} s** |
+    | Maximum solve time | **{_r["max_time"]:.3f} s** |
+    | Mean returned value | **{_r["mean_value"]:.2f}** |
+    | Mean returned cost | **{_r["mean_cost"]:.2f}** |
+
+    A case is counted as successfully validated when it reports
+    `status = ok`, has a recorded solve time, has no recorded error,
+    and returns non-negative plan value, plan cost and trip count.
+    """),
+                mo.md("### Results by number of wings"),
+                mo.ui.table(
+                    _r["by_wings"],
+                    selection=None,
+                ),
+                mo.md(f"""
+    ### Finding
+
+    {_r["finding"]}
+    """),
+                mo.md(f"""
+    ### Complete test record
+
+    The table below contains **all {_r["total"]:,} recorded cases** from
+    `{_r["path"]}`. No sampling or filtering is applied; it is rendered
+    as a scrollable/paginated table in the notebook rather than printed
+    in full.
+
+    Each row preserves the original seed, facility size, budget/cap,
+    returned value and cost, number of trips, source of the solution,
+    runtime, termination status and any recorded error.
+    """),
+                mo.ui.table(_r["display"], selection=None, page_size=50),
+                mo.md("---"),
+            ]
+        )
+
+
+    mo.vstack(_ext_n_blocks)
+    return (pd,)
 
 
 @app.cell
